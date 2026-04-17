@@ -2,7 +2,7 @@ import * as anchor from "@coral-xyz/anchor";
 import * as splToken from "@solana/spl-token";
 import { BankrunProvider } from "anchor-bankrun";
 import { BanksClient, ProgramTestContext } from "solana-bankrun";
-import { FusionSwap } from "../../target/types/fusion_swap";
+import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import chai, { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
 import {
@@ -11,7 +11,7 @@ import {
   trackReceivedTokenAndTx,
 } from "../utils/utils";
 
-const FusionSwapIDL = require("../../target/idl/fusion_swap.json");
+const ClearstoneFusionIDL = require("../../target/idl/clearstone_fusion.json");
 chai.use(chaiAsPromised);
 
 describe("Cancel by Resolver", () => {
@@ -24,7 +24,7 @@ describe("Cancel by Resolver", () => {
   let banksClient: BanksClient;
   let context: ProgramTestContext;
   let state: TestState;
-  let program: anchor.Program<FusionSwap>;
+  let program: anchor.Program<ClearstoneFusion>;
   let payer: anchor.web3.Keypair;
   let tokenAccountRent: number;
 
@@ -44,7 +44,7 @@ describe("Cancel by Resolver", () => {
     banksClient = context.banksClient;
     payer = context.payer;
 
-    program = new anchor.Program<FusionSwap>(FusionSwapIDL, provider);
+    program = new anchor.Program<ClearstoneFusion>(ClearstoneFusionIDL, provider);
 
     state = await TestState.bankrunCreate(context, payer, usersKeypairs, {
       tokensNums: 3,
@@ -93,7 +93,7 @@ describe("Cancel by Resolver", () => {
 
     const transactionPromise = () =>
       program.methods
-        .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
+        .cancelByResolver(escrow.orderConfig, defaultRewardLimit, null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -157,7 +157,7 @@ describe("Cancel by Resolver", () => {
 
     expect(
       program.methods
-        .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
+        .cancelByResolver(escrow.orderConfig, defaultRewardLimit, null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -224,7 +224,7 @@ describe("Cancel by Resolver", () => {
 
         const transactionPromise = () =>
           program.methods
-            .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
+            .cancelByResolver(escrow.orderConfig, defaultRewardLimit, null)
             .accountsPartial({
               resolver: state.bob.keypair.publicKey,
               maker: state.alice.keypair.publicKey,
@@ -307,7 +307,7 @@ describe("Cancel by Resolver", () => {
 
     const transactionPromise = () =>
       program.methods
-        .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
+        .cancelByResolver(escrow.orderConfig, defaultRewardLimit, null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -383,7 +383,7 @@ describe("Cancel by Resolver", () => {
 
     const transactionPromise = () =>
       program.methods
-        .cancelByResolver(escrow.orderConfig, resolverPremium)
+        .cancelByResolver(escrow.orderConfig, resolverPremium, null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -459,7 +459,7 @@ describe("Cancel by Resolver", () => {
 
     const transactionPromise = () =>
       program.methods
-        .cancelByResolver(escrow.orderConfig, new anchor.BN(0))
+        .cancelByResolver(escrow.orderConfig, new anchor.BN(0), null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -523,7 +523,7 @@ describe("Cancel by Resolver", () => {
     await setCurrentTime(context, state.defaultExpirationTime);
 
     await program.methods
-      .cancelByResolver(escrow.orderConfig, new anchor.BN(0))
+      .cancelByResolver(escrow.orderConfig, new anchor.BN(0), null)
       .accountsPartial({
         resolver: state.bob.keypair.publicKey,
         maker: state.alice.keypair.publicKey,
@@ -568,7 +568,7 @@ describe("Cancel by Resolver", () => {
 
     await expect(
       program.methods
-        .cancelByResolver(escrow.orderConfig, new anchor.BN(0))
+        .cancelByResolver(escrow.orderConfig, new anchor.BN(0), null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -606,7 +606,7 @@ describe("Cancel by Resolver", () => {
 
     await expect(
       program.methods
-        .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
+        .cancelByResolver(escrow.orderConfig, defaultRewardLimit, null)
         .accountsPartial({
           resolver: state.bob.keypair.publicKey,
           maker: state.alice.keypair.publicKey,
@@ -624,46 +624,7 @@ describe("Cancel by Resolver", () => {
     ).to.be.rejectedWith("Error Code: OrderNotExpired");
   });
 
-  it("Resolver can't cancel if the caller is not a whitelisted resolver", async () => {
-    const escrow = await state.createEscrow({
-      escrowProgram: program,
-      payer,
-      provider: banksClient,
-      orderConfig: state.orderConfig({
-        fee: {
-          maxCancellationPremium: defaultMaxCancellationPremium,
-          protocolDstAcc: undefined,
-          integratorDstAcc: undefined,
-          protocolFee: undefined,
-          integratorFee: undefined,
-          surplusPercentage: undefined,
-        },
-        cancellationAuctionDuration: order.auctionDuration,
-      }),
-    });
-
-    await setCurrentTime(context, state.defaultExpirationTime + 1);
-    await expect(
-      program.methods
-        .cancelByResolver(escrow.orderConfig, defaultRewardLimit)
-        .accountsPartial({
-          resolver: state.charlie.keypair.publicKey,
-          maker: state.alice.keypair.publicKey,
-          makerReceiver: escrow.orderConfig.receiver,
-          srcMint: escrow.orderConfig.srcMint,
-          dstMint: escrow.orderConfig.dstMint,
-          escrow: escrow.escrow,
-          escrowSrcAta: escrow.ata,
-          protocolDstAcc: escrow.orderConfig.fee.protocolDstAcc,
-          integratorDstAcc: escrow.orderConfig.fee.integratorDstAcc,
-          srcTokenProgram: splToken.TOKEN_PROGRAM_ID,
-        })
-        .signers([state.charlie.keypair])
-        .rpc()
-    ).to.be.rejectedWith(
-      "AnchorError caused by account: resolver_access. Error Code: AccountNotInitialized"
-    );
-  });
+  // Per-policy authorization tests for `cancelByResolver` live in tests/suits/resolver-policy.ts.
 
   it("Maker can't create an escrow if the fee is greater than lamports balance", async () => {
     await expect(

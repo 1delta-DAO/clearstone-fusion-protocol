@@ -1,6 +1,9 @@
 MIT License
 
 © 2021, 1inch. All rights reserved.
+© 2026, Clearstone. All rights reserved.
+
+This software is a fork of 1inch `solana-fusion-protocol` (https://github.com/1inch/solana-fusion-protocol), modified under the terms of the MIT License below. The original 1inch copyright notice is retained; the Clearstone copyright covers modifications only. "1inch" and "Fusion" are trademarks of their respective owners and are not licensed by this file.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -9,8 +9,8 @@ import { BN, Program } from "@coral-xyz/anchor";
 import * as splToken from "@solana/spl-token";
 const fs = require("fs");
 
-import FUSION_IDL from "../../target/idl/fusion_swap.json";
-import { FusionSwap } from "../../target/types/fusion_swap";
+import FUSION_IDL from "../../target/idl/clearstone_fusion.json";
+import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import {
   calculateOrderHash,
   defaultAuctionData,
@@ -21,6 +21,7 @@ import {
   getTokenDecimals,
   loadKeypairFromFile,
   OrderConfig,
+  permissionlessPolicy,
   prompt_,
 } from "../utils";
 
@@ -28,7 +29,7 @@ import { AuctionData, FeeConfig } from "../../ts-common/common";
 
 async function create(
   connection: Connection,
-  program: Program<FusionSwap>,
+  program: Program<ClearstoneFusion>,
   makerKeypair: Keypair,
   srcAmount: BN,
   minDstAmount: BN,
@@ -62,6 +63,7 @@ async function create(
     },
     dutchAuctionData,
     cancellationAuctionDuration,
+    resolverPolicy: permissionlessPolicy(),
     srcMint,
     dstMint,
     receiver,
@@ -130,7 +132,7 @@ async function main() {
   const orderId = Number(prompt_("order-id", "Enter order id: "));
 
   const connection = new Connection(clusterUrl, "confirmed");
-  const fusionSwap = new Program<FusionSwap>(FUSION_IDL, { connection });
+  const fusionSwap = new Program<ClearstoneFusion>(FUSION_IDL, { connection });
 
   const makerKeypair = await loadKeypairFromFile(makerKeypairPath);
 

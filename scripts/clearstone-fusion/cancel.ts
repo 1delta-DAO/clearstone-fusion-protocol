@@ -8,8 +8,8 @@ import {
 import { Program } from "@coral-xyz/anchor";
 import * as splToken from "@solana/spl-token";
 
-import FUSION_IDL from "../../target/idl/fusion_swap.json";
-import { FusionSwap } from "../../target/types/fusion_swap";
+import FUSION_IDL from "../../target/idl/clearstone_fusion.json";
+import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import {
   findEscrowAddress,
   getClusterUrlEnv,
@@ -19,7 +19,7 @@ import {
 
 async function cancel(
   connection: Connection,
-  program: Program<FusionSwap>,
+  program: Program<ClearstoneFusion>,
   makerKeypair: Keypair,
   srcMint: PublicKey,
   srcAssetIsNative: boolean,
@@ -72,7 +72,7 @@ async function main() {
     prompt_("is-native", "Is src asset native? (true/false): ") === "true";
 
   const connection = new Connection(clusterUrl, "confirmed");
-  const fusionSwap = new Program<FusionSwap>(FUSION_IDL, { connection });
+  const fusionSwap = new Program<ClearstoneFusion>(FUSION_IDL, { connection });
 
   const makerKeypair = await loadKeypairFromFile(makerKeypairPath);
 

@@ -32,4 +32,16 @@ pub enum FusionError {
     MissingTakerDstAta,
     #[msg("Missing maker src ata")]
     MissingMakerSrcAta,
+    #[msg("Caller is not authorized by the order's resolver policy")]
+    UnauthorizedResolver,
+    #[msg("AllowedList exceeds the maximum inline size")]
+    AllowedListTooLong,
+    #[msg("Merkle proof is required for MerkleRoot policy but was not provided")]
+    MissingMerkleProof,
+    #[msg("Merkle proof was provided for a policy that does not accept one")]
+    UnexpectedMerkleProof,
+    #[msg("Merkle proof exceeds the maximum allowed depth")]
+    MerkleProofTooDeep,
+    #[msg("Merkle proof does not verify against the order's root")]
+    InvalidMerkleProof,
 }

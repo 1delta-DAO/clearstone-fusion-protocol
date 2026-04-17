@@ -6,8 +6,31 @@ import os from "os";
 import * as splToken from "@solana/spl-token";
 import { sha256 } from "@noble/hashes/sha256";
 import * as borsh from "borsh";
-import { OrderConfig, FeeConfig, AuctionData } from "../ts-common/common";
-export { OrderConfig, FeeConfig };
+import {
+  OrderConfig,
+  FeeConfig,
+  AuctionData,
+  ResolverPolicy,
+} from "../ts-common/common";
+export { OrderConfig, FeeConfig, ResolverPolicy };
+
+export const MAX_ALLOWED_LIST_LEN = 16;
+export const MAX_MERKLE_PROOF_LEN = 20;
+
+export function permissionlessPolicy(): ResolverPolicy {
+  return { allowedList: { "0": [] } };
+}
+
+function normalizeResolverPolicyForBorsh(policy: ResolverPolicy): object {
+  if ("allowedList" in policy) {
+    return {
+      allowedList: {
+        "0": policy.allowedList["0"].map((pk) => pk.toBuffer()),
+      },
+    };
+  }
+  return { merkleRoot: { "0": policy.merkleRoot["0"] } };
+}
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 const prompt = require("prompt-sync")({ sigint: true });
@@ -81,27 +104,6 @@ export function findEscrowAddress(
   return escrow;
 }
 
-export function findResolverAccessAddress(
-  programId: PublicKey,
-  user: PublicKey
-): PublicKey {
-  const [resolverAccess] = PublicKey.findProgramAddressSync(
-    [anchor.utils.bytes.utf8.encode("resolver_access"), user.toBuffer()],
-    programId
-  );
-
-  return resolverAccess;
-}
-
-export function findWhitelistStateAddress(programId: PublicKey): PublicKey {
-  const [whitelistState] = PublicKey.findProgramAddressSync(
-    [anchor.utils.bytes.utf8.encode("whitelist_state")],
-    programId
-  );
-
-  return whitelistState;
-}
-
 export function defaultExpirationTime(): number {
   return ~~(new Date().getTime() / 1000) + 86400; // now + 1 day
 }
@@ -141,6 +143,7 @@ export function calculateOrderHash(orderConfig: OrderConfig): Uint8Array {
       ),
     },
     cancellationAuctionDuration: orderConfig.cancellationAuctionDuration,
+    resolverPolicy: normalizeResolverPolicyForBorsh(orderConfig.resolverPolicy),
 
     // Accounts concatenated directly to OrderConfig
     protocolDstAcc: orderConfig.fee.protocolDstAcc?.toBuffer(),
@@ -188,6 +191,30 @@ const orderConfigSchema = {
       },
     },
     cancellationAuctionDuration: "u32",
+    resolverPolicy: {
+      enum: [
+        {
+          struct: {
+            allowedList: {
+              struct: {
+                "0": {
+                  array: { type: { array: { type: "u8", len: 32 } } },
+                },
+              },
+            },
+          },
+        },
+        {
+          struct: {
+            merkleRoot: {
+              struct: {
+                "0": { array: { type: "u8", len: 32 } },
+              },
+            },
+          },
+        },
+      ],
+    },
 
     // Accounts concatenated directly to OrderConfig
     protocolDstAcc: { option: { array: { type: "u8", len: 32 } } },

@@ -1,12 +1,12 @@
 [package]
-name = "fusion-swap"
+name = "clearstone-fusion"
 version = "0.1.0"
-description = "Created with Anchor"
+description = "Clearstone Fusion — Solana intent settlement (fork of 1inch solana-fusion-protocol)"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "fusion_swap"
+name = "clearstone_fusion"
 
 [features]
 default = []
@@ -23,7 +23,6 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 anchor-lang = { version = "0.31.1", features = ["init-if-needed"]}
 anchor-spl = "0.31.1"
 common = { path =  "../../common" }
-whitelist = { path = "../whitelist", features = ["no-entrypoint"] }
 muldiv = "1.0.1"
 
 [lints.rust]

@@ -1,11 +1,11 @@
 import * as anchor from "@coral-xyz/anchor";
 
-const FusionSwapIDL = require("../target/idl/fusion_swap.json");
+const ClearstoneFusionIDL = require("../target/idl/clearstone_fusion.json");
 
-const escrowType = FusionSwapIDL.types.find((t) => t.name === "Escrow");
+const escrowType = ClearstoneFusionIDL.types.find((t) => t.name === "Escrow");
 export type Escrow = (typeof escrowType)["type"]["fields"];
 
-const auctionDataType = FusionSwapIDL.types.find(
+const auctionDataType = ClearstoneFusionIDL.types.find(
   (t) => t.name === "AuctionData"
 );
 export type AuctionData = (typeof auctionDataType)["type"]["fields"];
@@ -19,6 +19,15 @@ export type FeeConfig = {
   maxCancellationPremium: anchor.BN;
 };
 
+/**
+ * Discriminated union mirroring the Anchor `ResolverPolicy` enum.
+ * Variants (frozen discriminants): 0 = `allowedList`, 1 = `merkleRoot`.
+ * An empty `allowedList` means permissionless (any taker may fill).
+ */
+export type ResolverPolicy =
+  | { allowedList: { "0": anchor.web3.PublicKey[] } }
+  | { merkleRoot: { "0": number[] } };
+
 export type OrderConfig = {
   id: number;
   srcAmount: anchor.BN;
@@ -30,6 +39,7 @@ export type OrderConfig = {
   fee: FeeConfig;
   dutchAuctionData: AuctionData;
   cancellationAuctionDuration: number;
+  resolverPolicy: ResolverPolicy;
   srcMint: anchor.web3.PublicKey | null;
   dstMint: anchor.web3.PublicKey | null;
   receiver: anchor.web3.PublicKey | null;

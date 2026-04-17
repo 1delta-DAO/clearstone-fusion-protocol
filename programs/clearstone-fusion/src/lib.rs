@@ -14,10 +14,11 @@ use muldiv::MulDiv;
 
 pub mod auction;
 pub mod error;
+pub mod merkle;
 
 use error::FusionError;
 
-declare_id!("HNarfxC3kYMMhFkxUFeYb8wHVdPzY5t9pupqW5fL2meM");
+declare_id!("9ShSnLUcWeg5BZzokj8mdo9cNHARCKa42kwmqSdBNM6J");
 
 enum UniTransferParams<'info> {
     NativeTransfer {
@@ -38,7 +39,7 @@ enum UniTransferParams<'info> {
 }
 
 #[program]
-pub mod fusion_swap {
+pub mod clearstone_fusion {
     use super::*;
 
     pub fn create(ctx: Context<Create>, order: OrderConfig) -> Result<()> {
@@ -46,6 +47,13 @@ pub mod fusion_swap {
             order.src_amount != 0 && order.min_dst_amount != 0,
             FusionError::InvalidAmount
         );
+
+        if let ResolverPolicy::AllowedList(list) = &order.resolver_policy {
+            require!(
+                list.len() <= MAX_ALLOWED_LIST_LEN,
+                FusionError::AllowedListTooLong
+            );
+        }
 
         // we support only original spl_token::native_mint
         require!(
@@ -130,7 +138,12 @@ pub mod fusion_swap {
         }
     }
 
-    pub fn fill(ctx: Context<Fill>, order: OrderConfig, amount: u64) -> Result<()> {
+    pub fn fill(
+        ctx: Context<Fill>,
+        order: OrderConfig,
+        amount: u64,
+        merkle_proof: Option<Vec<[u8; 32]>>,
+    ) -> Result<()> {
         require!(
             Clock::get()?.unix_timestamp < order.expiration_time as i64,
             FusionError::OrderExpired
@@ -142,6 +155,12 @@ pub mod fusion_swap {
         );
 
         require!(amount != 0, FusionError::InvalidAmount);
+
+        enforce_resolver_policy(
+            &order.resolver_policy,
+            &ctx.accounts.taker.key(),
+            merkle_proof,
+        )?;
 
         let order_src_mint = ctx.accounts.src_mint.key();
         let order_dst_mint = ctx.accounts.dst_mint.key();
@@ -346,6 +365,7 @@ pub mod fusion_swap {
         ctx: Context<CancelByResolver>,
         order: OrderConfig,
         reward_limit: u64,
+        merkle_proof: Option<Vec<[u8; 32]>>,
     ) -> Result<()> {
         require!(
             order.fee.max_cancellation_premium > 0,
@@ -360,6 +380,12 @@ pub mod fusion_swap {
             order.src_asset_is_native == ctx.accounts.maker_src_ata.is_none(),
             FusionError::InconsistentNativeSrcTrait
         );
+
+        enforce_resolver_policy(
+            &order.resolver_policy,
+            &ctx.accounts.resolver.key(),
+            merkle_proof,
+        )?;
 
         let order_hash = order_hash(
             &order,
@@ -504,16 +530,10 @@ pub struct Create<'info> {
 #[derive(Accounts)]
 #[instruction(order: OrderConfig)]
 pub struct Fill<'info> {
-    /// `taker`, who buys `src_mint` for `dst_mint`
+    /// `taker`, who buys `src_mint` for `dst_mint`. Authorized per the
+    /// order's `resolver_policy`.
     #[account(mut, signer)]
     taker: Signer<'info>,
-    /// Account allowed to fill the order
-    #[account(
-        seeds = [whitelist::RESOLVER_ACCESS_SEED, taker.key().as_ref()],
-        bump = resolver_access.bump,
-        seeds::program = whitelist::ID,
-    )]
-    resolver_access: Account<'info, whitelist::ResolverAccess>,
 
     /// CHECK: check is not necessary as maker is not spending any funds
     #[account(mut)]
@@ -640,17 +660,10 @@ pub struct Cancel<'info> {
 #[derive(Accounts)]
 #[instruction(order: OrderConfig)]
 pub struct CancelByResolver<'info> {
-    /// Account that cancels the escrow
+    /// Account that cancels the escrow. Authorized per the order's
+    /// `resolver_policy`.
     #[account(mut, signer)]
     resolver: Signer<'info>,
-
-    /// Account allowed to cancel the order
-    #[account(
-        seeds = [whitelist::RESOLVER_ACCESS_SEED, resolver.key().as_ref()],
-        bump = resolver_access.bump,
-        seeds::program = whitelist::ID,
-    )]
-    resolver_access: Account<'info, whitelist::ResolverAccess>,
 
     /// CHECK: check is not necessary as maker is not spending any funds
     #[account(mut)]
@@ -728,6 +741,34 @@ pub struct FeeConfig {
     max_cancellation_premium: u64,
 }
 
+/// Maximum number of resolver pubkeys that can be carried inline in
+/// `ResolverPolicy::AllowedList`. Sets are capped here to bound instruction-
+/// data size; larger sets must use `MerkleRoot`.
+pub const MAX_ALLOWED_LIST_LEN: usize = 16;
+
+/// Per-order, maker-signed resolver access policy.
+///
+/// The maker's signature binds the policy via `order_hash` (which includes
+/// the full `OrderConfig`), so a taker cannot substitute a different policy
+/// at fill time — the escrow PDA would not derive.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum ResolverPolicy {
+    /// Inline list of allowed resolver pubkeys. An empty list means
+    /// permissionless (any taker may fill / cancel-by-resolver). This is
+    /// the default variant emitted by `Default`.
+    AllowedList(Vec<Pubkey>),
+    /// Keccak256 Merkle root over allowed resolver pubkeys (OZ-style
+    /// sorted pairs). The fill/cancel instruction takes a merkle proof
+    /// argument which is verified against this root.
+    MerkleRoot([u8; 32]),
+}
+
+impl Default for ResolverPolicy {
+    fn default() -> Self {
+        ResolverPolicy::AllowedList(Vec::new())
+    }
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct OrderConfig {
     id: u32,
@@ -740,6 +781,39 @@ pub struct OrderConfig {
     fee: FeeConfig,
     dutch_auction_data: AuctionData,
     cancellation_auction_duration: u32,
+    resolver_policy: ResolverPolicy,
+}
+
+fn enforce_resolver_policy(
+    policy: &ResolverPolicy,
+    caller: &Pubkey,
+    merkle_proof: Option<Vec<[u8; 32]>>,
+) -> Result<()> {
+    match policy {
+        ResolverPolicy::AllowedList(list) => {
+            require!(
+                merkle_proof.is_none(),
+                FusionError::UnexpectedMerkleProof
+            );
+            require!(
+                list.is_empty() || list.contains(caller),
+                FusionError::UnauthorizedResolver
+            );
+            Ok(())
+        }
+        ResolverPolicy::MerkleRoot(root) => {
+            let proof = merkle_proof.ok_or(FusionError::MissingMerkleProof)?;
+            require!(
+                proof.len() <= merkle::MAX_MERKLE_PROOF_LEN,
+                FusionError::MerkleProofTooDeep
+            );
+            require!(
+                merkle::verify_resolver(&proof, root, caller),
+                FusionError::InvalidMerkleProof
+            );
+            Ok(())
+        }
+    }
 }
 
 fn order_hash(

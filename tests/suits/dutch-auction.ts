@@ -1,7 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import * as splBankrunToken from "spl-token-bankrun";
 import * as splToken from "@solana/spl-token";
-import { FusionSwap } from "../../target/types/fusion_swap";
+import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import chai, { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
 import {
@@ -14,7 +14,7 @@ import { BanksClient, ProgramTestContext } from "solana-bankrun";
 import { calculateOrderHash } from "../../scripts/utils";
 chai.use(chaiAsPromised);
 
-const FusionSwapIDL = require("../../target/idl/fusion_swap.json");
+const ClearstoneFusionIDL = require("../../target/idl/clearstone_fusion.json");
 const BASE_POINTS = 100000;
 
 function arraysBetweenEqual(actual: BigInt[], min: BigInt[], max: BigInt[]) {
@@ -32,7 +32,7 @@ describe("Dutch Auction", () => {
   let banksClient: BanksClient;
   let context: ProgramTestContext;
   let state: TestState;
-  let program: anchor.Program<FusionSwap>;
+  let program: anchor.Program<ClearstoneFusion>;
 
   const auction = {
     startTime: 0, // we update it before each test
@@ -55,7 +55,7 @@ describe("Dutch Auction", () => {
     banksClient = context.banksClient;
     payer = context.payer;
 
-    program = new anchor.Program<FusionSwap>(FusionSwapIDL, provider);
+    program = new anchor.Program<ClearstoneFusion>(ClearstoneFusionIDL, provider);
 
     state = await TestState.bankrunCreate(context, payer, usersKeypairs, {
       tokensNums: 3,
@@ -82,7 +82,7 @@ describe("Dutch Auction", () => {
     await setCurrentTime(context, state.defaultExpirationTime);
     await expect(
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accounts(state.buildAccountsDataForFill({}))
         .signers([state.bob.keypair])
         .rpc()
@@ -128,7 +128,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(state.buildAccountsDataForFill({}))
         .signers([state.bob.keypair])
         .rpc();
@@ -166,7 +166,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(state.buildAccountsDataForFill({}))
         .signers([state.bob.keypair])
         .rpc();
@@ -219,7 +219,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(state.buildAccountsDataForFill({}))
         .signers([state.bob.keypair])
         .rpc();
@@ -267,7 +267,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(state.buildAccountsDataForFill({}))
         .signers([state.bob.keypair])
         .rpc();
@@ -313,7 +313,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(
           state.buildAccountsDataForFill({
             escrow: state.escrows[0].escrow,
@@ -382,7 +382,7 @@ describe("Dutch Auction", () => {
 
     const transactionPromise = () =>
       program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount)
+        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
         .accountsPartial(
           state.buildAccountsDataForFill({
             escrow: state.escrows[0].escrow,

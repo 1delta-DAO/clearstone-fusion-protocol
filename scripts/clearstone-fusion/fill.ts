@@ -9,14 +9,11 @@ import { BN, Program } from "@coral-xyz/anchor";
 import * as splToken from "@solana/spl-token";
 const fs = require("fs");
 
-import FUSION_IDL from "../../target/idl/fusion_swap.json";
-import WHITELIST_IDL from "../../target/idl/whitelist.json";
-import { FusionSwap } from "../../target/types/fusion_swap";
-import { Whitelist } from "../../target/types/whitelist";
+import FUSION_IDL from "../../target/idl/clearstone_fusion.json";
+import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import {
   calculateOrderHash,
   findEscrowAddress,
-  findResolverAccessAddress,
   getClusterUrlEnv,
   getTokenDecimals,
   loadKeypairFromFile,
@@ -26,12 +23,12 @@ import {
 
 async function fill(
   connection: Connection,
-  program: Program<FusionSwap>,
-  whitelistProgramId: PublicKey,
+  program: Program<ClearstoneFusion>,
   takerKeypair: Keypair,
   maker: PublicKey,
   amount: number,
-  orderConfig: OrderConfig
+  orderConfig: OrderConfig,
+  merkleProof: number[][] | null = null
 ): Promise<void> {
   const orderHash = calculateOrderHash(orderConfig);
   let taker = takerKeypair.publicKey;
@@ -46,8 +43,6 @@ async function fill(
     escrow,
     true
   );
-
-  const resolverAccess = findResolverAccessAddress(whitelistProgramId, taker);
 
   const takerSrcAta = await splToken.getAssociatedTokenAddress(
     orderConfig.srcMint,
@@ -70,10 +65,13 @@ async function fill(
   );
 
   const fillIx = await program.methods
-    .fill(orderConfig, new BN(amount * Math.pow(10, srcMintDecimals)))
+    .fill(
+      orderConfig,
+      new BN(amount * Math.pow(10, srcMintDecimals)),
+      merkleProof
+    )
     .accountsPartial({
       taker,
-      resolverAccess,
       maker,
       makerReceiver: orderConfig.receiver,
       srcMint: orderConfig.srcMint,
@@ -121,8 +119,7 @@ async function main() {
   const amount = Number(prompt_("amount", "Enter fill amount: "));
 
   const connection = new Connection(clusterUrl, "confirmed");
-  const fusionSwap = new Program<FusionSwap>(FUSION_IDL, { connection });
-  const whitelist = new Program<Whitelist>(WHITELIST_IDL, { connection });
+  const fusionSwap = new Program<ClearstoneFusion>(FUSION_IDL, { connection });
 
   try {
     const orderHash = calculateOrderHash(orderConfig);
@@ -160,7 +157,6 @@ async function main() {
   await fill(
     connection,
     fusionSwap,
-    whitelist.programId,
     takerKeypair,
     maker,
     amount,
