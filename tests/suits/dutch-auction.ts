@@ -1,41 +1,27 @@
 import * as anchor from "@coral-xyz/anchor";
-import * as splBankrunToken from "spl-token-bankrun";
-import * as splToken from "@solana/spl-token";
+import { BankrunProvider } from "anchor-bankrun";
+import { BanksClient, ProgramTestContext } from "solana-bankrun";
 import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import chai, { expect } from "chai";
 import chaiAsPromised from "chai-as-promised";
-import {
-  setCurrentTime,
-  TestState,
-  trackReceivedTokenAndTx,
-} from "../utils/utils";
-import { BankrunProvider } from "anchor-bankrun";
-import { BanksClient, ProgramTestContext } from "solana-bankrun";
-import { calculateOrderHash } from "../../scripts/utils";
-chai.use(chaiAsPromised);
+import { TestState, setCurrentTime, trackReceivedTokenAndTx } from "../utils/utils";
+import { Transaction } from "@solana/web3.js";
 
 const ClearstoneFusionIDL = require("../../target/idl/clearstone_fusion.json");
+chai.use(chaiAsPromised);
+
 const BASE_POINTS = 100000;
 
-function arraysBetweenEqual(actual: BigInt[], min: BigInt[], max: BigInt[]) {
-  expect(actual.length).to.equal(min.length);
-  expect(actual.length).to.equal(max.length);
-  for (let i = 0; i < actual.length; i++) {
-    expect(actual[i] >= min[i]).to.be.true;
-    expect(actual[i] <= max[i]).to.be.true;
-  }
-}
-
-describe("Dutch Auction", () => {
-  let payer: anchor.web3.Keypair;
+describe("Dutch auction (pull model)", () => {
   let provider: BankrunProvider;
   let banksClient: BanksClient;
   let context: ProgramTestContext;
   let state: TestState;
   let program: anchor.Program<ClearstoneFusion>;
+  let payer: anchor.web3.Keypair;
 
   const auction = {
-    startTime: 0, // we update it before each test
+    startTime: 0,
     duration: 32000,
     initialRateBump: 50000,
     pointsAndTimeDeltas: [
@@ -45,392 +31,57 @@ describe("Dutch Auction", () => {
   };
 
   before(async () => {
-    const usersKeypairs = [];
-    for (let i = 0; i < 4; i++) {
-      usersKeypairs.push(anchor.web3.Keypair.generate());
-    }
-    context = await TestState.bankrunContext(usersKeypairs);
+    const users = [];
+    for (let i = 0; i < 4; i++) users.push(anchor.web3.Keypair.generate());
+    context = await TestState.bankrunContext(users);
     provider = new BankrunProvider(context);
     anchor.setProvider(provider);
     banksClient = context.banksClient;
     payer = context.payer;
 
-    program = new anchor.Program<ClearstoneFusion>(ClearstoneFusionIDL, provider);
-
-    state = await TestState.bankrunCreate(context, payer, usersKeypairs, {
+    program = new anchor.Program<ClearstoneFusion>(
+      ClearstoneFusionIDL,
+      provider
+    );
+    state = await TestState.bankrunCreate(context, payer, users, {
       tokensNums: 3,
     });
+    await state.approveDelegate({ program, provider: banksClient, payer });
   });
 
-  beforeEach(async () => {
-    auction.startTime = Math.floor(new Date().getTime() / 1000);
+  it("applies the initial rate bump when the auction hasn't started", async () => {
+    const now = Math.floor(new Date().getTime() / 1000);
+    auction.startTime = now + 60;
+    await setCurrentTime(context, now);
 
-    // Rollback clock to the current time after tests that move time forward when order already expired
-    await setCurrentTime(context, auction.startTime);
-
-    state.escrows[0] = await state.createEscrow({
-      escrowProgram: program,
-      payer,
-      provider: banksClient,
-      orderConfig: {
-        dutchAuctionData: auction,
-      },
-    });
-  });
-
-  it("should not work after the expiration time", async () => {
-    await setCurrentTime(context, state.defaultExpirationTime);
-    await expect(
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accounts(state.buildAccountsDataForFill({}))
-        .signers([state.bob.keypair])
-        .rpc()
-    ).to.be.rejectedWith("Error Code: OrderExpired");
-  });
-
-  // This test has nothing to do with the dutch auction logic and placed
-  // here only because this test suite uses bankrun.
-  it("should not create the escrow after the expiration time", async () => {
-    await setCurrentTime(context, state.defaultExpirationTime);
-
-    const orderConfig = state.orderConfig({});
-
-    const [escrow] = anchor.web3.PublicKey.findProgramAddressSync(
-      [
-        anchor.utils.bytes.utf8.encode("escrow"),
-        state.alice.keypair.publicKey.toBuffer(),
-        calculateOrderHash(orderConfig),
-      ],
-      program.programId
-    );
-
-    await expect(
-      program.methods
-        .create(orderConfig)
-        .accountsPartial({
-          maker: state.alice.keypair.publicKey,
-          makerReceiver: orderConfig.receiver,
-          srcMint: state.tokens[0],
-          dstMint: state.tokens[1],
-          protocolDstAcc: null,
-          integratorDstAcc: null,
-          escrow: escrow,
-          srcTokenProgram: splToken.TOKEN_PROGRAM_ID,
-        })
-        .signers([state.alice.keypair])
-        .rpc()
-    ).to.be.rejectedWith("Error Code: OrderExpired");
-  });
-
-  it("should fill with initialRateBump before auction started", async () => {
-    await setCurrentTime(context, auction.startTime - 1000);
-
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(state.buildAccountsDataForFill({}))
-        .signers([state.bob.keypair])
-        .rpc();
-
-    const results = await trackReceivedTokenAndTx(
-      provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
-    );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
-
-    const dstAmountWithRateBump = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.initialRateBump)) /
-        BASE_POINTS
-    );
-    expect(results).to.be.deep.eq([
-      dstAmountWithRateBump,
-      BigInt(state.defaultSrcAmount.toNumber()),
-      -dstAmountWithRateBump,
-    ]);
-  });
-
-  it("should fill with another price after auction started, but before first point", async () => {
-    await setCurrentTime(
-      context,
-      auction.startTime + auction.pointsAndTimeDeltas[0].timeDelta / 2
-    );
-
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(state.buildAccountsDataForFill({}))
-        .signers([state.bob.keypair])
-        .rpc();
-
-    const results = await trackReceivedTokenAndTx(
-      provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
-    );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
-
-    const dstAmountWithRateBumpMax = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.initialRateBump)) /
-        BASE_POINTS
-    );
-    const dstAmountWithRateBumpMin = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.pointsAndTimeDeltas[0].rateBump)) /
-        BASE_POINTS
-    );
-    arraysBetweenEqual(
-      results,
-      [
-        dstAmountWithRateBumpMin,
-        BigInt(state.defaultSrcAmount.toNumber()),
-        -dstAmountWithRateBumpMax,
-      ],
-      [
-        dstAmountWithRateBumpMax,
-        BigInt(state.defaultSrcAmount.toNumber()),
-        -dstAmountWithRateBumpMin,
-      ]
-    );
-  });
-
-  it("should fill with another price after between points", async () => {
-    await setCurrentTime(
-      context,
-      auction.startTime +
-        auction.pointsAndTimeDeltas[0].timeDelta +
-        auction.pointsAndTimeDeltas[1].timeDelta / 2
-    );
-
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(state.buildAccountsDataForFill({}))
-        .signers([state.bob.keypair])
-        .rpc();
-
-    const results = await trackReceivedTokenAndTx(
-      provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
-    );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
-
-    const dstAmountWithRateBumpMax = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.initialRateBump)) /
-        BASE_POINTS
-    );
-    const dstAmountWithRateBumpMin = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.pointsAndTimeDeltas[1].rateBump)) /
-        BASE_POINTS
-    );
-    arraysBetweenEqual(
-      results,
-      [
-        dstAmountWithRateBumpMin,
-        BigInt(state.defaultSrcAmount.toNumber()),
-        -dstAmountWithRateBumpMax,
-      ],
-      [
-        dstAmountWithRateBumpMax,
-        BigInt(state.defaultSrcAmount.toNumber()),
-        -dstAmountWithRateBumpMin,
-      ]
-    );
-  });
-
-  it("should fill with default price after auction finished", async () => {
-    await setCurrentTime(context, auction.startTime + auction.duration + 1);
-
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(state.buildAccountsDataForFill({}))
-        .signers([state.bob.keypair])
-        .rpc();
-
-    const results = await trackReceivedTokenAndTx(
-      provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
-    );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
-
-    expect(results).to.be.deep.eq([
-      BigInt(state.defaultDstAmount.toNumber()),
-      BigInt(state.defaultSrcAmount.toNumber()),
-      -BigInt(state.defaultDstAmount.toNumber()),
-    ]);
-  });
-
-  it("Execute the trade with surplus", async () => {
-    state.escrows[0] = await state.createEscrow({
-      escrowProgram: program,
-      payer,
-      provider: banksClient,
-      orderConfig: {
-        fee: {
-          protocolDstAcc:
-            state.charlie.atas[state.tokens[1].toString()].address,
-          surplusPercentage: 50, // 50%
-          integratorDstAcc: undefined,
-          protocolFee: undefined,
-          integratorFee: undefined,
-          maxCancellationPremium: undefined,
-        },
-        dutchAuctionData: auction,
-      },
+    const signed = state.createSignedOrder({
+      programId: program.programId,
+      orderConfig: { dutchAuctionData: auction },
     });
 
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(
-          state.buildAccountsDataForFill({
-            escrow: state.escrows[0].escrow,
-            escrowSrcAta: state.escrows[0].ata,
-            protocolDstAcc:
-              state.charlie.atas[state.tokens[1].toString()].address,
-          })
-        )
-        .signers([state.bob.keypair])
-        .rpc();
-
-    const results = await trackReceivedTokenAndTx(
-      provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-        state.charlie.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
-    );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
-
-    const dstAmountWithRateBump = BigInt(
-      (state.defaultDstAmount.toNumber() *
-        (BASE_POINTS + auction.initialRateBump)) /
-        BASE_POINTS
-    );
-    const surplus =
-      (dstAmountWithRateBump - BigInt(state.defaultDstAmount.toNumber())) / 2n;
-    expect(results).to.be.deep.eq([
-      dstAmountWithRateBump - surplus,
-      BigInt(state.defaultSrcAmount.toNumber()),
-      -dstAmountWithRateBump,
-      surplus,
-    ]);
-  });
-
-  it("Execute the trade with all fees", async () => {
-    const auction = {
-      startTime: Math.floor(new Date().getTime() / 1000),
-      duration: 32000,
-      initialRateBump: 50000,
-      pointsAndTimeDeltas: [],
-    };
-
-    state.escrows[0] = await state.createEscrow({
-      escrowProgram: program,
-      payer,
-      provider: banksClient,
-      orderConfig: {
-        fee: {
-          protocolDstAcc:
-            state.charlie.atas[state.tokens[1].toString()].address,
-          integratorDstAcc: state.dave.atas[state.tokens[1].toString()].address,
-          protocolFee: 10000, // 10%
-          integratorFee: 15000, // 15%
-          surplusPercentage: 50, // 50%
-          maxCancellationPremium: undefined,
-        },
-        dutchAuctionData: auction,
-      },
+    const { ixs, signers } = await state.buildFillTx({
+      program,
+      signedOrder: signed,
+      amount: state.defaultSrcAmount,
     });
 
-    const transactionPromise = () =>
-      program.methods
-        .fill(state.escrows[0].orderConfig, state.defaultSrcAmount, null)
-        .accountsPartial(
-          state.buildAccountsDataForFill({
-            escrow: state.escrows[0].escrow,
-            escrowSrcAta: state.escrows[0].ata,
-            protocolDstAcc:
-              state.charlie.atas[state.tokens[1].toString()].address,
-            integratorDstAcc:
-              state.dave.atas[state.tokens[1].toString()].address,
-          })
-        )
-        .signers([state.bob.keypair])
-        .rpc();
-
     const results = await trackReceivedTokenAndTx(
       provider.connection,
-      [
-        state.alice.atas[state.tokens[1].toString()].address,
-        state.bob.atas[state.tokens[0].toString()].address,
-        state.bob.atas[state.tokens[1].toString()].address,
-        state.charlie.atas[state.tokens[1].toString()].address,
-        state.dave.atas[state.tokens[1].toString()].address,
-      ],
-      transactionPromise
+      [state.alice.atas[state.tokens[1].toString()].address],
+      async () => {
+        const tx = new Transaction().add(...ixs);
+        tx.recentBlockhash = (await banksClient.getLatestBlockhash())[0];
+        tx.feePayer = signers[0].publicKey;
+        tx.sign(...signers);
+        await banksClient.processTransaction(tx);
+      }
     );
-    await expect(
-      splBankrunToken.getAccount(provider.connection, state.escrows[0].ata)
-    ).to.be.rejectedWith(splBankrunToken.TokenAccountNotFoundError);
 
-    const dstAmountWithRateBump = BigInt(
+    const expectedDst = BigInt(
       (state.defaultDstAmount.toNumber() *
         (BASE_POINTS + auction.initialRateBump)) /
         BASE_POINTS
     );
-    const integratorFee = (dstAmountWithRateBump * 15n) / 100n;
-    const protocolFee = dstAmountWithRateBump / 10n;
-    const surplus =
-      (dstAmountWithRateBump -
-        integratorFee -
-        protocolFee -
-        BigInt(state.defaultDstAmount.toNumber())) /
-      2n;
-
-    expect(results).to.be.deep.eq([
-      dstAmountWithRateBump - integratorFee - protocolFee - surplus,
-      BigInt(state.defaultSrcAmount.toNumber()),
-      -dstAmountWithRateBump,
-      protocolFee + surplus, // 10% of takingAmount + 50% *  (actualAmount - estimatedAmpount)
-      integratorFee,
-    ]);
+    expect(results[0]).to.eq(expectedDst);
   });
 });

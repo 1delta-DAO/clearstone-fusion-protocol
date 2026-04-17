@@ -1,7 +1,12 @@
 use anchor_lang::prelude::Pubkey;
 use anchor_lang::solana_program::keccak::hashv;
 
-pub const MAX_MERKLE_PROOF_LEN: usize = 20;
+/// Hard cap on Merkle proof depth. Supports up to 2^10 = 1024 resolvers per
+/// order, which is well above any realistic curated set. The cap also keeps
+/// the `fill` / `cancel_by_resolver` instruction data small enough to fit
+/// inside Solana's 1232-byte transaction limit alongside the rest of the
+/// order payload and accounts.
+pub const MAX_MERKLE_PROOF_LEN: usize = 10;
 
 const LEAF_DOMAIN: &[u8] = &[0x00];
 const NODE_DOMAIN: &[u8] = &[0x01];

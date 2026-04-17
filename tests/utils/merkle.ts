@@ -1,22 +1,35 @@
 import { PublicKey } from "@solana/web3.js";
-const createKeccak = require("keccak");
+import { keccak_256 } from "@noble/hashes/sha3";
 
-const LEAF_DOMAIN = Buffer.from([0x00]);
-const NODE_DOMAIN = Buffer.from([0x01]);
+const LEAF_DOMAIN = new Uint8Array([0x00]);
+const NODE_DOMAIN = new Uint8Array([0x01]);
 
-function keccak256(...chunks: Buffer[]): Buffer {
-  const h = createKeccak("keccak256");
-  for (const c of chunks) h.update(c);
-  return h.digest();
+function concat(...chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
 }
 
-export function hashLeaf(pubkey: PublicKey): Buffer {
-  return keccak256(LEAF_DOMAIN, pubkey.toBuffer());
+function compare(a: Uint8Array, b: Uint8Array): number {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.length - b.length;
 }
 
-function hashPair(a: Buffer, b: Buffer): Buffer {
-  const [lo, hi] = Buffer.compare(a, b) <= 0 ? [a, b] : [b, a];
-  return keccak256(NODE_DOMAIN, lo, hi);
+export function hashLeaf(pubkey: PublicKey): Uint8Array {
+  return keccak_256(concat(LEAF_DOMAIN, pubkey.toBytes()));
+}
+
+function hashPair(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const [lo, hi] = compare(a, b) <= 0 ? [a, b] : [b, a];
+  return keccak_256(concat(NODE_DOMAIN, lo, hi));
 }
 
 /**
@@ -33,18 +46,14 @@ export function buildResolverMerkleTree(resolvers: PublicKey[]): {
     throw new Error("cannot build merkle tree over empty resolver set");
   }
   const leaves = resolvers.map(hashLeaf);
-  // `levels[0]` = leaves, `levels[levels.length - 1]` = [root].
-  const levels: Buffer[][] = [leaves];
+  const levels: Uint8Array[][] = [leaves];
   while (levels[levels.length - 1].length > 1) {
     const prev = levels[levels.length - 1];
-    const next: Buffer[] = [];
+    const next: Uint8Array[] = [];
     for (let i = 0; i < prev.length; i += 2) {
-      if (i + 1 < prev.length) {
-        next.push(hashPair(prev[i], prev[i + 1]));
-      } else {
-        // Odd leaf is promoted unchanged to the next level.
-        next.push(prev[i]);
-      }
+      next.push(
+        i + 1 < prev.length ? hashPair(prev[i], prev[i + 1]) : prev[i]
+      );
     }
     levels.push(next);
   }

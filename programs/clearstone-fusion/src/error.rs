@@ -2,16 +2,10 @@ use anchor_lang::error_code;
 
 #[error_code]
 pub enum FusionError {
-    #[msg("Inconsistent native src trait")]
-    InconsistentNativeSrcTrait,
-    #[msg("Inconsistent native dst trait")]
-    InconsistentNativeDstTrait,
     #[msg("Invalid amount")]
     InvalidAmount,
     #[msg("Missing maker dst ata")]
     MissingMakerDstAta,
-    #[msg("Not enough tokens in escrow")]
-    NotEnoughTokensInEscrow,
     #[msg("Order expired")]
     OrderExpired,
     #[msg("Invalid estimated taking amount")]
@@ -24,14 +18,8 @@ pub enum FusionError {
     InconsistentIntegratorFeeConfig,
     #[msg("Order not expired")]
     OrderNotExpired,
-    #[msg("Invalid cancellation fee")]
-    InvalidCancellationFee,
-    #[msg("Cancel order by resolver is forbidden")]
-    CancelOrderByResolverIsForbidden,
     #[msg("Missing taker dst ata")]
     MissingTakerDstAta,
-    #[msg("Missing maker src ata")]
-    MissingMakerSrcAta,
     #[msg("Caller is not authorized by the order's resolver policy")]
     UnauthorizedResolver,
     #[msg("AllowedList exceeds the maximum inline size")]
@@ -44,4 +32,18 @@ pub enum FusionError {
     MerkleProofTooDeep,
     #[msg("Merkle proof does not verify against the order's root")]
     InvalidMerkleProof,
+    #[msg("Order has been canceled by the maker")]
+    OrderCanceled,
+    #[msg("Order has already been fully filled")]
+    OrderFullyFilled,
+    #[msg("Preceding Ed25519 signature verification instruction is missing")]
+    MissingSignatureInstruction,
+    #[msg("Preceding instruction is not an Ed25519 signature verification")]
+    InvalidSignatureInstruction,
+    #[msg("Ed25519 signature verification instruction is malformed")]
+    MalformedSignatureInstruction,
+    #[msg("Signed pubkey does not match the declared maker")]
+    SignerMismatch,
+    #[msg("Signed message does not match the expected order hash")]
+    MessageMismatch,
 }

@@ -7,6 +7,8 @@ import {
   LAMPORTS_PER_SOL,
   TransactionSignature,
   Message,
+  TransactionInstruction,
+  SYSVAR_INSTRUCTIONS_PUBKEY,
 } from "@solana/web3.js";
 import * as splBankrunToken from "spl-token-bankrun";
 import {
@@ -19,7 +21,14 @@ import {
 import bs58 from "bs58";
 import { ClearstoneFusion } from "../../target/types/clearstone_fusion";
 import { SYSTEM_PROGRAM_ID } from "@coral-xyz/anchor/dist/cjs/native/system";
-import { calculateOrderHash, permissionlessPolicy } from "../../scripts/utils";
+import {
+  buildEd25519VerifyIx,
+  calculateOrderHash,
+  findDelegateAuthority,
+  findOrderStateAddress,
+  permissionlessPolicy,
+  signOrderHash,
+} from "../../scripts/utils";
 import { OrderConfig } from "../../ts-common/common";
 
 export type User = {
@@ -29,10 +38,17 @@ export type User = {
   };
 };
 
-export type Escrow = {
-  escrow: anchor.web3.PublicKey;
+/**
+ * A maker-signed order ready to be submitted via `fill`. Produced by
+ * `TestState.createSignedOrder`. Holds the hash + signature so tests don't
+ * need to re-derive them on every fill.
+ */
+export type SignedOrder = {
   orderConfig: OrderConfig;
-  ata: anchor.web3.PublicKey;
+  orderHash: Uint8Array;
+  signature: Uint8Array;
+  orderStatePda: PublicKey;
+  makerKeypair: anchor.web3.Keypair;
 };
 
 export type CompactFee = {
@@ -98,13 +114,13 @@ export class TestState {
   charlie: User;
   dave: User;
   tokens: Array<anchor.web3.PublicKey> = [];
-  escrows: Array<Escrow> = [];
+  orders: Array<SignedOrder> = [];
   order_id = 0;
   defaultSrcAmount = new anchor.BN(100);
   defaultDstAmount = new anchor.BN(30);
   defaultExpirationTime = ~~(new Date().getTime() / 1000) + 86400; // now + 1 day
   auction = {
-    startTime: 0xffffffff - 32000, // default auction start in the far far future and order use default formula
+    startTime: 0xffffffff - 32000,
     duration: 32000,
     initialRateBump: 0,
     pointsAndTimeDeltas: [],
@@ -127,27 +143,9 @@ export class TestState {
       instance.dave as User,
     ] = await createUsers(4, instance.tokens, provider, payer);
 
-    await mintTokens(
-      instance.tokens[0],
-      instance.alice,
-      100_000_000,
-      provider,
-      payer
-    );
-    await mintTokens(
-      instance.tokens[1],
-      instance.bob,
-      100_000_000,
-      provider,
-      payer
-    );
-    await mintTokens(
-      instance.tokens[1],
-      instance.charlie,
-      100_000_000,
-      provider,
-      payer
-    );
+    await mintTokens(instance.tokens[0], instance.alice, 100_000_000, provider, payer);
+    await mintTokens(instance.tokens[1], instance.bob, 100_000_000, provider, payer);
+    await mintTokens(instance.tokens[1], instance.charlie, 100_000_000, provider, payer);
     return instance;
   }
 
@@ -156,7 +154,6 @@ export class TestState {
     params?: typeof DEFAULT_STARTANCHOR,
     airdropInfo?: AccountInfoBytes
   ): Promise<ProgramTestContext> {
-    // Fill settings with default values and rewrite some values with provided
     airdropInfo = { ...DEFAULT_AIRDROPINFO, ...airdropInfo };
     params = { ...DEFAULT_STARTANCHOR, ...params };
 
@@ -164,10 +161,7 @@ export class TestState {
       params.path,
       params.extraPrograms,
       params.accounts ||
-        userKeyPairs.map((u) => ({
-          address: u.publicKey,
-          info: airdropInfo,
-        })),
+        userKeyPairs.map((u) => ({ address: u.publicKey, info: airdropInfo })),
       params.computeMaxUnits,
       params.transactionAccountLockLimit,
       params.deactivateFeatures
@@ -181,7 +175,6 @@ export class TestState {
     settings: { tokensNums: number }
   ): Promise<TestState> {
     const provider = context.banksClient;
-
     const instance = new TestState();
     instance.tokens = await createTokens(settings.tokensNums, provider, payer);
     instance.tokens.push(splToken.NATIVE_MINT);
@@ -192,157 +185,190 @@ export class TestState {
       instance.dave as User,
     ] = await createAtasUsers(usersKeypairs, instance.tokens, provider, payer);
 
-    await mintTokens(
-      instance.tokens[0],
-      instance.alice,
-      100_000_000,
-      provider,
-      payer
-    );
-    await mintTokens(
-      instance.tokens[1],
-      instance.bob,
-      100_000_000,
-      provider,
-      payer
-    );
-    await mintTokens(
-      instance.tokens[1],
-      instance.charlie,
-      100_000_000,
-      provider,
-      payer
-    );
+    await mintTokens(instance.tokens[0], instance.alice, 100_000_000, provider, payer);
+    await mintTokens(instance.tokens[1], instance.bob, 100_000_000, provider, payer);
+    await mintTokens(instance.tokens[1], instance.charlie, 100_000_000, provider, payer);
     return instance;
   }
 
+  /**
+   * Alice approves the program's delegate PDA to spend up to `amount` of
+   * `srcMint` from her ATA. Call once per test setup (or per mint).
+   */
+  async approveDelegate({
+    program,
+    provider,
+    payer,
+    srcMint,
+    amount,
+    owner,
+    srcTokenProgram = splToken.TOKEN_PROGRAM_ID,
+  }: {
+    program: anchor.Program<ClearstoneFusion>;
+    provider: anchor.AnchorProvider | BanksClient;
+    payer: anchor.web3.Keypair;
+    srcMint?: anchor.web3.PublicKey;
+    amount?: anchor.BN | number;
+    owner?: User;
+    srcTokenProgram?: anchor.web3.PublicKey;
+  }) {
+    const mint = srcMint ?? this.tokens[0];
+    const makerUser = owner ?? this.alice;
+    const approveAmount = amount ?? new anchor.BN(1_000_000_000);
+    const delegate = findDelegateAuthority(program.programId);
+    const ata = makerUser.atas[mint.toString()].address;
+    const approveIx = splToken.createApproveInstruction(
+      ata,
+      delegate,
+      makerUser.keypair.publicKey,
+      BigInt(
+        approveAmount instanceof anchor.BN
+          ? approveAmount.toString()
+          : approveAmount.toString()
+      ),
+      [],
+      srcTokenProgram
+    );
+    const tx = new Transaction().add(approveIx);
+    if (provider instanceof anchor.AnchorProvider) {
+      await sendAndConfirmTransaction(provider.connection, tx, [
+        payer,
+        makerUser.keypair,
+      ]);
+    } else {
+      tx.recentBlockhash = (await provider.getLatestBlockhash())[0];
+      tx.sign(payer);
+      tx.sign(makerUser.keypair);
+      await provider.processTransaction(tx);
+    }
+  }
+
+  /**
+   * Maker-side order construction: build `OrderConfig`, compute the canonical
+   * order hash, and sign it with the maker's key. Nothing lands on-chain
+   * until a resolver calls `fill`.
+   */
+  createSignedOrder({
+    programId,
+    orderConfig,
+    makerKeypair,
+  }: {
+    programId: PublicKey;
+    orderConfig?: Partial<OrderConfig>;
+    makerKeypair?: anchor.web3.Keypair;
+  }): SignedOrder {
+    const maker = makerKeypair ?? this.alice.keypair;
+    const cfg = this.orderConfig(orderConfig, maker.publicKey);
+    const orderHash = calculateOrderHash(programId, cfg);
+    const signature = signOrderHash(orderHash, maker);
+    const orderStatePda = findOrderStateAddress(
+      programId,
+      maker.publicKey,
+      Buffer.from(orderHash)
+    );
+    const signed: SignedOrder = {
+      orderConfig: cfg,
+      orderHash,
+      signature,
+      orderStatePda,
+      makerKeypair: maker,
+    };
+    this.orders.push(signed);
+    return signed;
+  }
+
+  /**
+   * Build the Anchor-accounts object for `fill` from a signed order + an
+   * (optional) taker user. Falls back to Bob as taker.
+   */
   buildAccountsDataForFill({
-    taker = this.bob.keypair.publicKey,
-    maker = this.alice.keypair.publicKey,
-    makerReceiver = this.alice.keypair.publicKey,
-    srcMint = this.tokens[0],
-    dstMint = this.tokens[1],
-    escrow = this.escrows[0].escrow,
-    escrowSrcAta = this.escrows[0].ata,
-    makerDstAta = this.alice.atas[this.tokens[1].toString()].address,
-    takerSrcAta = this.bob.atas[this.tokens[0].toString()].address,
-    takerDstAta = this.bob.atas[this.tokens[1].toString()].address,
+    program,
+    signedOrder,
+    taker,
+    takerSrcAta,
+    takerDstAta,
     protocolDstAcc = null,
     integratorDstAcc = null,
     srcTokenProgram = splToken.TOKEN_PROGRAM_ID,
     dstTokenProgram = splToken.TOKEN_PROGRAM_ID,
+  }: {
+    program: anchor.Program<ClearstoneFusion>;
+    signedOrder: SignedOrder;
+    taker?: User;
+    takerSrcAta?: PublicKey;
+    takerDstAta?: PublicKey;
+    protocolDstAcc?: PublicKey | null;
+    integratorDstAcc?: PublicKey | null;
+    srcTokenProgram?: PublicKey;
+    dstTokenProgram?: PublicKey;
   }): any {
+    const takerUser = taker ?? this.bob;
+    const maker = signedOrder.makerKeypair.publicKey;
+    const srcMint = signedOrder.orderConfig.srcMint!;
+    const dstMint = signedOrder.orderConfig.dstMint!;
     return {
-      taker,
+      taker: takerUser.keypair.publicKey,
       maker,
-      makerReceiver,
+      makerReceiver: signedOrder.orderConfig.receiver,
       srcMint,
       dstMint,
-      escrow,
-      escrowSrcAta,
-      makerDstAta,
-      takerSrcAta,
-      takerDstAta,
+      makerSrcAta: this.alice.atas[srcMint.toString()].address,
+      takerSrcAta: takerSrcAta ?? takerUser.atas[srcMint.toString()].address,
+      makerDstAta: this.alice.atas[dstMint.toString()].address,
+      takerDstAta: takerDstAta ?? takerUser.atas[dstMint.toString()].address,
       protocolDstAcc,
       integratorDstAcc,
+      orderState: signedOrder.orderStatePda,
+      delegateAuthority: findDelegateAuthority(program.programId),
       srcTokenProgram,
       dstTokenProgram,
+      instructionsSysvar: SYSVAR_INSTRUCTIONS_PUBKEY,
     };
   }
 
-  async createEscrow({
-    escrowProgram,
-    provider,
-    payer,
-    orderConfig,
-    srcTokenProgram = splToken.TOKEN_PROGRAM_ID,
+  /**
+   * Convenience: build `[ed25519_verify_ix, fill_ix]` ready to submit.
+   */
+  async buildFillTx({
+    program,
+    signedOrder,
+    amount,
+    taker,
+    merkleProof = null,
+    extraAccounts = {},
   }: {
-    escrowProgram: anchor.Program<ClearstoneFusion>;
-    provider: anchor.AnchorProvider | BanksClient;
-    payer: anchor.web3.Keypair;
-    orderConfig?: Partial<OrderConfig>;
-    srcTokenProgram?: anchor.web3.PublicKey;
-  }): Promise<Escrow> {
-    const orderConfig_: OrderConfig = this.orderConfig(orderConfig);
-
-    // Derive escrow address
-    const [escrow] = anchor.web3.PublicKey.findProgramAddressSync(
-      [
-        anchor.utils.bytes.utf8.encode("escrow"),
-        this.alice.keypair.publicKey.toBuffer(),
-        calculateOrderHash(orderConfig_),
-      ],
-      escrowProgram.programId
+    program: anchor.Program<ClearstoneFusion>;
+    signedOrder: SignedOrder;
+    amount: anchor.BN;
+    taker?: User;
+    merkleProof?: number[][] | null;
+    extraAccounts?: Record<string, any>;
+  }): Promise<{ ixs: TransactionInstruction[]; signers: anchor.web3.Keypair[] }> {
+    const verifyIx = buildEd25519VerifyIx(
+      signedOrder.makerKeypair.publicKey,
+      signedOrder.orderHash,
+      signedOrder.signature
     );
-
-    const escrowAta = await splToken.getAssociatedTokenAddress(
-      orderConfig_.srcMint,
-      escrow,
-      true,
-      srcTokenProgram
-    );
-
-    if (
-      orderConfig_.srcMint == splToken.NATIVE_MINT &&
-      !orderConfig_.srcAssetIsNative
-    ) {
-      await prepareNativeTokens({
-        amount: orderConfig_.srcAmount,
-        user: this.alice,
-        provider,
-        payer,
-      });
-    }
-    if (
-      orderConfig_.dstMint == splToken.NATIVE_MINT &&
-      !orderConfig_.dstAssetIsNative
-    ) {
-      await prepareNativeTokens({
-        amount: orderConfig_.minDstAmount,
-        user: this.bob,
-        provider,
-        payer,
-      });
-    }
-
-    const txBuilder = escrowProgram.methods
-      .create(orderConfig_)
-      .accountsPartial({
-        maker: this.alice.keypair.publicKey,
-        makerReceiver: orderConfig_.receiver,
-        srcMint: orderConfig_.srcMint,
-        dstMint: orderConfig_.dstMint,
-        protocolDstAcc: orderConfig_.fee.protocolDstAcc,
-        integratorDstAcc: orderConfig_.fee.integratorDstAcc,
-        escrow,
-        srcTokenProgram,
-        makerSrcAta: orderConfig_.srcAssetIsNative ? null : undefined,
-      })
-      .signers([this.alice.keypair]);
-
-    if (provider instanceof anchor.AnchorProvider) {
-      const tx = await txBuilder.transaction();
-
-      await sendAndConfirmTransaction(provider.connection, tx, [
-        payer,
-        this.alice.keypair,
-      ]);
-    } else {
-      await txBuilder.rpc();
-    }
-
-    return {
-      escrow,
-      orderConfig: orderConfig_,
-      ata: escrowAta,
+    const takerUser = taker ?? this.bob;
+    const accounts = {
+      ...this.buildAccountsDataForFill({ program, signedOrder, taker: takerUser }),
+      ...extraAccounts,
     };
+    const fillIx = await program.methods
+      .fill(signedOrder.orderConfig, amount, merkleProof)
+      .accountsPartial(accounts)
+      .instruction();
+    return { ixs: [verifyIx, fillIx], signers: [takerUser.keypair] };
   }
 
-  orderConfig(params: Partial<OrderConfig> = {}): OrderConfig {
+  orderConfig(
+    params: Partial<OrderConfig> = {},
+    makerPubkey?: PublicKey
+  ): OrderConfig {
     const definedParams = Object.fromEntries(
       Object.entries(params).filter(([_, v]) => v !== undefined)
     );
-    var fee;
+    let fee: any;
     if (definedParams.fee) {
       fee = Object.fromEntries(
         Object.entries(definedParams.fee).filter(([_, v]) => v !== undefined)
@@ -354,11 +380,9 @@ export class TestState {
       minDstAmount: this.defaultDstAmount,
       estimatedDstAmount: this.defaultDstAmount,
       expirationTime: this.defaultExpirationTime,
-      srcAssetIsNative: false,
       dstAssetIsNative: false,
-      receiver: this.alice.keypair.publicKey,
+      receiver: makerPubkey ?? this.alice.keypair.publicKey,
       dutchAuctionData: this.auction,
-      cancellationAuctionDuration: 0,
       resolverPolicy: permissionlessPolicy(),
       srcMint: this.tokens[0],
       dstMint: this.tokens[1],
@@ -369,7 +393,6 @@ export class TestState {
         protocolFee: 0,
         integratorFee: 0,
         surplusPercentage: 0,
-        maxCancellationPremium: new anchor.BN(0),
         ...(fee ?? {}),
       },
     };
@@ -385,7 +408,6 @@ export async function createTokens(
   programId = splToken.TOKEN_PROGRAM_ID
 ): Promise<Array<anchor.web3.PublicKey>> {
   let tokens: Array<anchor.web3.PublicKey> = [];
-
   const [tokenLibrary, connection, extraArgs] =
     provider instanceof anchor.AnchorProvider
       ? [splToken, provider.connection, [undefined, programId]]
@@ -441,7 +463,6 @@ export async function createAtasUsers(
   tokenProgram = splToken.TOKEN_PROGRAM_ID
 ): Promise<Array<User>> {
   let users: Array<User> = [];
-
   const [tokenLibrary, connection, extraArgs] =
     provider instanceof anchor.AnchorProvider
       ? [splToken, provider.connection, [undefined, tokenProgram]]
@@ -464,14 +485,8 @@ export async function createAtasUsers(
         undefined,
         tokenProgram
       );
-      debugLog(
-        `User_${i} :: token = ${token.toString()} :: ata = ${atas[
-          token.toString()
-        ].address.toBase58()}`
-      );
     }
     users.push({ keypair, atas });
-    debugLog(`User_${i} ::`, users[i].keypair.publicKey.toString(), "\n");
   }
   return users;
 }
@@ -499,51 +514,6 @@ export async function mintTokens(
     [],
     ...extraArgs
   );
-  const balance = await tokenLibrary.getAccount(
-    connection,
-    user.atas[token.toString()].address,
-    undefined,
-    tokenProgram
-  );
-
-  debugLog(
-    `User :: ${user.keypair.publicKey.toString()} :: token = ${token.toString()} :: balance = ${
-      balance.amount
-    }`
-  );
-}
-
-async function prepareNativeTokens({
-  amount,
-  user,
-  provider,
-  payer,
-}: {
-  amount: anchor.BN;
-  user: User;
-  provider: anchor.AnchorProvider | BanksClient;
-  payer: anchor.web3.Keypair;
-}) {
-  const ata = user.atas[splToken.NATIVE_MINT.toString()].address;
-  const wrapTransaction = new Transaction().add(
-    anchor.web3.SystemProgram.transfer({
-      fromPubkey: user.keypair.publicKey,
-      toPubkey: ata,
-      lamports: amount.toNumber(),
-    }),
-    splToken.createSyncNativeInstruction(ata)
-  );
-  if (provider instanceof anchor.AnchorProvider) {
-    await sendAndConfirmTransaction(provider.connection, wrapTransaction, [
-      payer,
-      user.keypair,
-    ]);
-  } else {
-    wrapTransaction.recentBlockhash = (await provider.getLatestBlockhash())[0];
-    wrapTransaction.sign(payer);
-    wrapTransaction.sign(user.keypair);
-    await provider.processTransaction(wrapTransaction);
-  }
 }
 
 export async function setCurrentTime(
@@ -591,9 +561,7 @@ class TxInfo {
   }
 
   toString() {
-    return `Tx ${this.label}: ${this.length} bytes, ${
-      this.computeUnits
-    } compute units\n${this.instructions
+    return `Tx ${this.label}: ${this.length} bytes, ${this.computeUnits} compute units\n${this.instructions
       .map(
         (ix, i) =>
           `\tinst ${i}: ${ix.data.length} bytes + ${ix.accountsIndexes.length} accounts \n`
@@ -615,7 +583,7 @@ export async function printTxCosts(
 
   const serializedMessage = tx.transaction.message.serialize();
   const signaturesSize = tx.transaction.signatures.length * 64;
-  const totalSize = serializedMessage.length + 1 + signaturesSize; // 1 byte for numSignatures
+  const totalSize = serializedMessage.length + 1 + signaturesSize;
 
   const txInfo = new TxInfo({
     label,
@@ -643,28 +611,68 @@ export async function printTxCosts(
   console.log(txInfo.toString());
 }
 
+/**
+ * Pull the Anchor error name out of a bankrun-surfaced transaction error.
+ * Bankrun returns `custom program error: 0x….` strings with no name; we look
+ * the code up in the program's IDL.
+ */
+export function errorNameFromBankrun(
+  program: anchor.Program<ClearstoneFusion>,
+  err: unknown
+): string | null {
+  const msg = typeof err === "string" ? err : (err as any)?.message ?? String(err);
+  const m = msg.match(/custom program error: (0x[0-9a-fA-F]+)/);
+  if (!m) return null;
+  const code = parseInt(m[1], 16);
+  const entry = (program.idl as any).errors?.find((e: any) => e.code === code);
+  return entry?.name ?? null;
+}
+
+/**
+ * Await `promise`, assert it rejects, and verify the underlying program
+ * error matches `expectedName`. Works for both AnchorError-wrapped and
+ * raw-bankrun rejections.
+ */
+/**
+ * Await `promise`, assert it rejects, and verify the underlying program
+ * error matches `expectedName` (case-insensitive — the Anchor IDL emits
+ * camelCase names while the Rust enum uses PascalCase).
+ */
+export async function expectProgramError(
+  program: anchor.Program<ClearstoneFusion>,
+  promise: Promise<any>,
+  expectedName: string
+): Promise<void> {
+  const norm = (s: string) => s.toLowerCase();
+  try {
+    await promise;
+  } catch (e: any) {
+    const anchorName = e?.error?.errorCode?.code;
+    if (anchorName && norm(anchorName) === norm(expectedName)) return;
+    const bankrunName = errorNameFromBankrun(program, e);
+    if (bankrunName && norm(bankrunName) === norm(expectedName)) return;
+    throw new Error(
+      `expected program error ${expectedName}, got ${
+        anchorName ?? bankrunName ?? "(unrecognized)"
+      }: ${e?.message ?? e}`
+    );
+  }
+  throw new Error(`expected program error ${expectedName}, but promise resolved`);
+}
+
 export async function waitForNewBlock(
   connection: anchor.web3.Connection,
   targetHeight: number
 ): Promise<void> {
-  debugLog(`Waiting for ${targetHeight} new blocks`);
   return new Promise(async (resolve: any) => {
-    // Get the last valid block height of the blockchain
     const { lastValidBlockHeight } = await connection.getLatestBlockhash();
-
-    // Set an interval to check for new blocks every 1000ms
     const intervalId = setInterval(async () => {
-      // Get the new valid block height
       const { lastValidBlockHeight: newValidBlockHeight } =
         await connection.getLatestBlockhash();
-
-      // Check if the new valid block height is greater than the target block height
       if (newValidBlockHeight > lastValidBlockHeight + targetHeight) {
-        // If the target block height is reached, clear the interval and resolve the promise
         clearInterval(intervalId);
         resolve();
       }
     }, 1000);
   });
 }
-

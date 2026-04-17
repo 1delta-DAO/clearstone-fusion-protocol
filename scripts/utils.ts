@@ -1,4 +1,10 @@
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import {
+  Connection,
+  PublicKey,
+  Keypair,
+  TransactionInstruction,
+  Ed25519Program,
+} from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
 import fs from "fs";
 import path from "path";
@@ -6,6 +12,7 @@ import os from "os";
 import * as splToken from "@solana/spl-token";
 import { sha256 } from "@noble/hashes/sha256";
 import * as borsh from "borsh";
+import nacl from "tweetnacl";
 import {
   OrderConfig,
   FeeConfig,
@@ -14,8 +21,15 @@ import {
 } from "../ts-common/common";
 export { OrderConfig, FeeConfig, ResolverPolicy };
 
-export const MAX_ALLOWED_LIST_LEN = 16;
-export const MAX_MERKLE_PROOF_LEN = 20;
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
+const prompt = require("prompt-sync")({ sigint: true });
+
+export const MAX_ALLOWED_LIST_LEN = 10;
+export const MAX_MERKLE_PROOF_LEN = 10;
+
+export const DELEGATE_SEED = anchor.utils.bytes.utf8.encode("delegate");
+export const ORDER_STATE_SEED = anchor.utils.bytes.utf8.encode("order");
 
 export function permissionlessPolicy(): ResolverPolicy {
   return { allowedList: { "0": [] } };
@@ -31,15 +45,11 @@ function normalizeResolverPolicyForBorsh(policy: ResolverPolicy): object {
   }
   return { merkleRoot: { "0": policy.merkleRoot["0"] } };
 }
-import yargs from "yargs";
-import { hideBin } from "yargs/helpers";
-const prompt = require("prompt-sync")({ sigint: true });
 
 export const defaultFeeConfig: FeeConfig = {
   protocolFee: 0,
   integratorFee: 0,
   surplusPercentage: 0,
-  maxCancellationPremium: new anchor.BN(0),
   protocolDstAcc: null,
   integratorDstAcc: null,
 };
@@ -62,17 +72,13 @@ export async function getTokenDecimals(
 export async function loadKeypairFromFile(
   filePath: string
 ): Promise<Keypair | undefined> {
-  // This is here so you can also load the default keypair from the file system.
   const resolvedPath = path.resolve(
     filePath.startsWith("~") ? filePath.replace("~", os.homedir()) : filePath
   );
-
   try {
     const raw = fs.readFileSync(resolvedPath);
     const formattedData = JSON.parse(raw.toString());
-
-    const keypair = Keypair.fromSecretKey(Uint8Array.from(formattedData));
-    return keypair;
+    return Keypair.fromSecretKey(Uint8Array.from(formattedData));
   } catch (error) {
     throw new Error(
       `Error reading keypair from file: ${(error as Error).message}`
@@ -80,28 +86,23 @@ export async function loadKeypairFromFile(
   }
 }
 
-export function findEscrowAddress(
+/** PDA of the program's single delegate authority (maker approves this). */
+export function findDelegateAuthority(programId: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync([DELEGATE_SEED], programId);
+  return pda;
+}
+
+/** PDA of the per-order OrderState tracking partial fills / cancellation. */
+export function findOrderStateAddress(
   programId: PublicKey,
   maker: PublicKey,
-  orderHash: Buffer | string
+  orderHash: Buffer | Uint8Array
 ): PublicKey {
-  if (typeof orderHash === "string") {
-    const arr = Array.from(orderHash.match(/../g) || [], (h) =>
-      parseInt(h, 16)
-    );
-    orderHash = Buffer.from(arr);
-  }
-
-  const [escrow] = PublicKey.findProgramAddressSync(
-    [
-      anchor.utils.bytes.utf8.encode("escrow"),
-      maker.toBuffer(),
-      Buffer.from(orderHash),
-    ],
+  const [pda] = PublicKey.findProgramAddressSync(
+    [ORDER_STATE_SEED, maker.toBuffer(), Buffer.from(orderHash)],
     programId
   );
-
-  return escrow;
+  return pda;
 }
 
 export function defaultExpirationTime(): number {
@@ -116,46 +117,6 @@ export function getClusterUrlEnv() {
   return clusterUrl;
 }
 
-export function calculateOrderHash(orderConfig: OrderConfig): Uint8Array {
-  const values = {
-    id: orderConfig.id,
-    srcAmount: orderConfig.srcAmount.toNumber(),
-    minDstAmount: orderConfig.minDstAmount.toNumber(),
-    estimatedDstAmount: orderConfig.estimatedDstAmount.toNumber(),
-    expirationTime: orderConfig.expirationTime,
-    srcAssetIsNative: orderConfig.srcAssetIsNative,
-    dstAssetIsNative: orderConfig.dstAssetIsNative,
-    fee: {
-      protocolFee: orderConfig.fee.protocolFee,
-      integratorFee: orderConfig.fee.integratorFee,
-      surplusPercentage: orderConfig.fee.surplusPercentage,
-      maxCancellationPremium: orderConfig.fee.maxCancellationPremium,
-    },
-    dutchAuctionData: {
-      startTime: orderConfig.dutchAuctionData.startTime,
-      duration: orderConfig.dutchAuctionData.duration,
-      initialRateBump: orderConfig.dutchAuctionData.initialRateBump,
-      pointsAndTimeDeltas: orderConfig.dutchAuctionData.pointsAndTimeDeltas.map(
-        (p) => ({
-          rateBump: p.rateBump,
-          timeDelta: p.timeDelta,
-        })
-      ),
-    },
-    cancellationAuctionDuration: orderConfig.cancellationAuctionDuration,
-    resolverPolicy: normalizeResolverPolicyForBorsh(orderConfig.resolverPolicy),
-
-    // Accounts concatenated directly to OrderConfig
-    protocolDstAcc: orderConfig.fee.protocolDstAcc?.toBuffer(),
-    integratorDstAcc: orderConfig.fee.integratorDstAcc?.toBuffer(),
-    srcMint: orderConfig.srcMint.toBuffer(),
-    dstMint: orderConfig.dstMint.toBuffer(),
-    receiver: orderConfig.receiver.toBuffer(),
-  };
-
-  return sha256(borsh.serialize(orderConfigSchema, values));
-}
-
 const orderConfigSchema = {
   struct: {
     id: "u32",
@@ -163,14 +124,12 @@ const orderConfigSchema = {
     minDstAmount: "u64",
     estimatedDstAmount: "u64",
     expirationTime: "u32",
-    srcAssetIsNative: "bool",
     dstAssetIsNative: "bool",
     fee: {
       struct: {
         protocolFee: "u16",
         integratorFee: "u16",
         surplusPercentage: "u8",
-        maxCancellationPremium: "u64",
       },
     },
     dutchAuctionData: {
@@ -190,7 +149,6 @@ const orderConfigSchema = {
         },
       },
     },
-    cancellationAuctionDuration: "u32",
     resolverPolicy: {
       enum: [
         {
@@ -216,7 +174,7 @@ const orderConfigSchema = {
       ],
     },
 
-    // Accounts concatenated directly to OrderConfig
+    // Accounts appended after `OrderConfig`; hashed together for domain integrity.
     protocolDstAcc: { option: { array: { type: "u8", len: 32 } } },
     integratorDstAcc: { option: { array: { type: "u8", len: 32 } } },
     srcMint: { array: { type: "u8", len: 32 } },
@@ -225,7 +183,74 @@ const orderConfigSchema = {
   },
 };
 
-// return argument if provided in cmd line, else ask the user and get it.
+/**
+ * Canonical order hash. Domain-separated by `programId` so a signature over
+ * one deployment cannot be replayed against another. Must match the Rust
+ * `order_hash` function exactly.
+ */
+export function calculateOrderHash(
+  programId: PublicKey,
+  orderConfig: OrderConfig
+): Uint8Array {
+  const values = {
+    id: orderConfig.id,
+    srcAmount: orderConfig.srcAmount.toNumber(),
+    minDstAmount: orderConfig.minDstAmount.toNumber(),
+    estimatedDstAmount: orderConfig.estimatedDstAmount.toNumber(),
+    expirationTime: orderConfig.expirationTime,
+    dstAssetIsNative: orderConfig.dstAssetIsNative,
+    fee: {
+      protocolFee: orderConfig.fee.protocolFee,
+      integratorFee: orderConfig.fee.integratorFee,
+      surplusPercentage: orderConfig.fee.surplusPercentage,
+    },
+    dutchAuctionData: {
+      startTime: orderConfig.dutchAuctionData.startTime,
+      duration: orderConfig.dutchAuctionData.duration,
+      initialRateBump: orderConfig.dutchAuctionData.initialRateBump,
+      pointsAndTimeDeltas: orderConfig.dutchAuctionData.pointsAndTimeDeltas.map(
+        (p) => ({ rateBump: p.rateBump, timeDelta: p.timeDelta })
+      ),
+    },
+    resolverPolicy: normalizeResolverPolicyForBorsh(orderConfig.resolverPolicy),
+    protocolDstAcc: orderConfig.fee.protocolDstAcc?.toBuffer(),
+    integratorDstAcc: orderConfig.fee.integratorDstAcc?.toBuffer(),
+    srcMint: orderConfig.srcMint.toBuffer(),
+    dstMint: orderConfig.dstMint.toBuffer(),
+    receiver: orderConfig.receiver.toBuffer(),
+  };
+
+  const body = borsh.serialize(orderConfigSchema, values);
+  const prefixed = Buffer.concat([programId.toBuffer(), Buffer.from(body)]);
+  return sha256(prefixed);
+}
+
+/** Maker-side: sign the order hash with Ed25519. Returns 64-byte signature. */
+export function signOrderHash(
+  orderHash: Uint8Array,
+  makerKeypair: Keypair
+): Uint8Array {
+  return nacl.sign.detached(orderHash, makerKeypair.secretKey);
+}
+
+/**
+ * Build the native Ed25519 verify instruction that must immediately precede
+ * `fill`. The fill handler reads this from the Instructions sysvar to prove
+ * the maker signed the order hash.
+ */
+export function buildEd25519VerifyIx(
+  makerPubkey: PublicKey,
+  orderHash: Uint8Array,
+  signature: Uint8Array
+): TransactionInstruction {
+  return Ed25519Program.createInstructionWithPublicKey({
+    publicKey: makerPubkey.toBytes(),
+    message: orderHash,
+    signature,
+  });
+}
+
+/** Prompt helper for CLI scripts. */
 export function prompt_(key: string, pmpt: string): string {
   const argv = yargs(hideBin(process.argv)).parse();
   if (key in argv) {

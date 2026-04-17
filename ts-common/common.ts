@@ -2,9 +2,6 @@ import * as anchor from "@coral-xyz/anchor";
 
 const ClearstoneFusionIDL = require("../target/idl/clearstone_fusion.json");
 
-const escrowType = ClearstoneFusionIDL.types.find((t) => t.name === "Escrow");
-export type Escrow = (typeof escrowType)["type"]["fields"];
-
 const auctionDataType = ClearstoneFusionIDL.types.find(
   (t) => t.name === "AuctionData"
 );
@@ -16,7 +13,6 @@ export type FeeConfig = {
   protocolFee: number;
   integratorFee: number;
   surplusPercentage: number;
-  maxCancellationPremium: anchor.BN;
 };
 
 /**
@@ -34,11 +30,9 @@ export type OrderConfig = {
   minDstAmount: anchor.BN;
   estimatedDstAmount: anchor.BN;
   expirationTime: number;
-  srcAssetIsNative: boolean;
   dstAssetIsNative: boolean;
   fee: FeeConfig;
   dutchAuctionData: AuctionData;
-  cancellationAuctionDuration: number;
   resolverPolicy: ResolverPolicy;
   srcMint: anchor.web3.PublicKey | null;
   dstMint: anchor.web3.PublicKey | null;

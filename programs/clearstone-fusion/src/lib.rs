@@ -1,24 +1,33 @@
 use anchor_lang::solana_program::hash::hashv;
+use anchor_lang::solana_program::sysvar;
 use anchor_lang::{prelude::*, system_program};
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::spl_token::native_mint,
     token_interface::{
-        close_account, transfer_checked, CloseAccount, Mint, TokenAccount, TokenInterface,
-        TransferChecked,
+        transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked,
     },
 };
-use auction::{calculate_premium, calculate_rate_bump, AuctionData};
+use auction::{calculate_rate_bump, AuctionData};
 use common::constants::*;
 use muldiv::MulDiv;
 
 pub mod auction;
 pub mod error;
 pub mod merkle;
+pub mod sig;
+pub mod state;
 
 use error::FusionError;
+use state::OrderState;
 
 declare_id!("9ShSnLUcWeg5BZzokj8mdo9cNHARCKa42kwmqSdBNM6J");
+
+/// PDA that every maker approves as delegate on their src-asset ATA.
+/// The program signs token pulls as this authority inside `fill`.
+pub const DELEGATE_SEED: &[u8] = b"delegate";
+
+/// Seed prefix for the per-order `OrderState` PDA.
+pub const ORDER_STATE_SEED: &[u8] = b"order";
 
 enum UniTransferParams<'info> {
     NativeTransfer {
@@ -27,7 +36,6 @@ enum UniTransferParams<'info> {
         amount: u64,
         program: Program<'info, System>,
     },
-
     TokenTransfer {
         from: AccountInfo<'info>,
         authority: AccountInfo<'info>,
@@ -42,119 +50,51 @@ enum UniTransferParams<'info> {
 pub mod clearstone_fusion {
     use super::*;
 
-    pub fn create(ctx: Context<Create>, order: OrderConfig) -> Result<()> {
-        require!(
-            order.src_amount != 0 && order.min_dst_amount != 0,
-            FusionError::InvalidAmount
-        );
-
-        if let ResolverPolicy::AllowedList(list) = &order.resolver_policy {
-            require!(
-                list.len() <= MAX_ALLOWED_LIST_LEN,
-                FusionError::AllowedListTooLong
-            );
-        }
-
-        // we support only original spl_token::native_mint
-        require!(
-            ctx.accounts.src_mint.key() == native_mint::id() || !order.src_asset_is_native,
-            FusionError::InconsistentNativeSrcTrait
-        );
-
-        require!(
-            ctx.accounts.dst_mint.key() == native_mint::id() || !order.dst_asset_is_native,
-            FusionError::InconsistentNativeDstTrait
-        );
-
-        require!(
-            Clock::get()?.unix_timestamp < order.expiration_time as i64,
-            FusionError::OrderExpired
-        );
-
-        require!(
-            order.fee.surplus_percentage as u64 <= BASE_1E2,
-            FusionError::InvalidProtocolSurplusFee
-        );
-
-        require!(
-            order.estimated_dst_amount >= order.min_dst_amount,
-            FusionError::InvalidEstimatedTakingAmount
-        );
-
-        // Iff protocol fee or surplus is positive, protocol_dst_acc must be set
-        require!(
-            (order.fee.protocol_fee > 0 || order.fee.surplus_percentage > 0)
-                == ctx.accounts.protocol_dst_acc.is_some(),
-            FusionError::InconsistentProtocolFeeConfig
-        );
-
-        // Iff integrator fee is positive, integrator_dst_acc must be set
-        require!(
-            (order.fee.integrator_fee > 0) == ctx.accounts.integrator_dst_acc.is_some(),
-            FusionError::InconsistentIntegratorFeeConfig
-        );
-
-        require!(
-            ctx.accounts.escrow_src_ata.to_account_info().lamports()
-                >= order.fee.max_cancellation_premium,
-            FusionError::InvalidCancellationFee
-        );
-
-        require!(
-            order.src_asset_is_native == ctx.accounts.maker_src_ata.is_none(),
-            FusionError::InconsistentNativeSrcTrait
-        );
-
-        // Maker => Escrow
-        if order.src_asset_is_native {
-            // Wrap SOL to wSOL
-            uni_transfer(&UniTransferParams::NativeTransfer {
-                from: ctx.accounts.maker.to_account_info(),
-                to: ctx.accounts.escrow_src_ata.to_account_info(),
-                amount: order.src_amount,
-                program: ctx.accounts.system_program.clone(),
-            })?;
-
-            anchor_spl::token::sync_native(CpiContext::new(
-                ctx.accounts.src_token_program.to_account_info(),
-                anchor_spl::token::SyncNative {
-                    account: ctx.accounts.escrow_src_ata.to_account_info(),
-                },
-            ))
-        } else {
-            uni_transfer(&UniTransferParams::TokenTransfer {
-                from: ctx
-                    .accounts
-                    .maker_src_ata
-                    .as_ref()
-                    .ok_or(FusionError::MissingMakerSrcAta)?
-                    .to_account_info(),
-                authority: ctx.accounts.maker.to_account_info(),
-                to: ctx.accounts.escrow_src_ata.to_account_info(),
-                mint: *ctx.accounts.src_mint.clone(),
-                amount: order.src_amount,
-                program: ctx.accounts.src_token_program.clone(),
-            })
-        }
-    }
-
+    /// Resolver fills (partially or fully) a maker-signed order.
+    ///
+    /// Requires the preceding instruction to be a native Ed25519 verify
+    /// over `(maker_pubkey, order_hash)`. Pulls src tokens from the
+    /// maker's ATA via the program's delegate PDA; the maker must have
+    /// previously called SPL Token `Approve` granting the delegate PDA
+    /// sufficient allowance.
     pub fn fill(
         ctx: Context<Fill>,
         order: OrderConfig,
         amount: u64,
         merkle_proof: Option<Vec<[u8; 32]>>,
     ) -> Result<()> {
+        require!(amount != 0, FusionError::InvalidAmount);
         require!(
             Clock::get()?.unix_timestamp < order.expiration_time as i64,
             FusionError::OrderExpired
         );
-
         require!(
-            amount <= ctx.accounts.escrow_src_ata.amount,
-            FusionError::NotEnoughTokensInEscrow
+            order.src_amount != 0 && order.min_dst_amount != 0,
+            FusionError::InvalidAmount
         );
-
-        require!(amount != 0, FusionError::InvalidAmount);
+        require!(
+            order.fee.surplus_percentage as u64 <= BASE_1E2,
+            FusionError::InvalidProtocolSurplusFee
+        );
+        require!(
+            order.estimated_dst_amount >= order.min_dst_amount,
+            FusionError::InvalidEstimatedTakingAmount
+        );
+        require!(
+            (order.fee.protocol_fee > 0 || order.fee.surplus_percentage > 0)
+                == ctx.accounts.protocol_dst_acc.is_some(),
+            FusionError::InconsistentProtocolFeeConfig
+        );
+        require!(
+            (order.fee.integrator_fee > 0) == ctx.accounts.integrator_dst_acc.is_some(),
+            FusionError::InconsistentIntegratorFeeConfig
+        );
+        if let ResolverPolicy::AllowedList(list) = &order.resolver_policy {
+            require!(
+                list.len() <= MAX_ALLOWED_LIST_LEN,
+                FusionError::AllowedListTooLong
+            );
+        }
 
         enforce_resolver_policy(
             &order.resolver_policy,
@@ -165,14 +105,10 @@ pub mod clearstone_fusion {
         let order_src_mint = ctx.accounts.src_mint.key();
         let order_dst_mint = ctx.accounts.dst_mint.key();
         let order_receiver = ctx.accounts.maker_receiver.key();
-        let protocol_dst_acc = ctx.accounts.protocol_dst_acc.as_ref().map(|acc| acc.key());
-        let integrator_dst_acc = ctx
-            .accounts
-            .integrator_dst_acc
-            .as_ref()
-            .map(|acc| acc.key());
+        let protocol_dst_acc = ctx.accounts.protocol_dst_acc.as_ref().map(|a| a.key());
+        let integrator_dst_acc = ctx.accounts.integrator_dst_acc.as_ref().map(|a| a.key());
 
-        let order_hash = &order_hash(
+        let order_hash = order_hash(
             &order,
             protocol_dst_acc,
             integrator_dst_acc,
@@ -181,43 +117,62 @@ pub mod clearstone_fusion {
             order_receiver,
         )?;
 
-        // Escrow => Taker
+        sig::verify_ed25519_preceding_ix(
+            &ctx.accounts.instructions_sysvar,
+            &ctx.accounts.maker.key(),
+            &order_hash,
+        )?;
+
+        // Lazy init of OrderState on first fill. Taker pays rent.
+        if ctx.accounts.order_state.expiration_time == 0 {
+            ctx.accounts.order_state.expiration_time = order.expiration_time;
+            ctx.accounts.order_state.bump = ctx.bumps.order_state;
+        }
+        require!(
+            !ctx.accounts.order_state.canceled,
+            FusionError::OrderCanceled
+        );
+
+        let filled = ctx.accounts.order_state.filled_amount;
+        let remaining = order
+            .src_amount
+            .checked_sub(filled)
+            .ok_or(FusionError::OrderFullyFilled)?;
+        require!(remaining > 0, FusionError::OrderFullyFilled);
+        let fill_amount = std::cmp::min(amount, remaining);
+
+        // Pull src from maker via the delegate PDA.
+        let delegate_bump = ctx.bumps.delegate_authority;
         transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.src_token_program.to_account_info(),
                 TransferChecked {
-                    from: ctx.accounts.escrow_src_ata.to_account_info(),
+                    from: ctx.accounts.maker_src_ata.to_account_info(),
                     mint: ctx.accounts.src_mint.to_account_info(),
                     to: ctx.accounts.taker_src_ata.to_account_info(),
-                    authority: ctx.accounts.escrow.to_account_info(),
+                    authority: ctx.accounts.delegate_authority.to_account_info(),
                 },
-                &[&[
-                    "escrow".as_bytes(),
-                    ctx.accounts.maker.key().as_ref(),
-                    order_hash,
-                    &[ctx.bumps.escrow],
-                ]],
+                &[&[DELEGATE_SEED, &[delegate_bump]]],
             ),
-            amount,
+            fill_amount,
             ctx.accounts.src_mint.decimals,
         )?;
 
         let dst_amount = get_dst_amount(
             order.src_amount,
             order.min_dst_amount,
-            amount,
+            fill_amount,
             Some(&order.dutch_auction_data),
         )?;
-
         let (protocol_fee_amount, integrator_fee_amount, maker_dst_amount) = get_fee_amounts(
             order.fee.integrator_fee,
             order.fee.protocol_fee,
             order.fee.surplus_percentage,
             dst_amount,
-            get_dst_amount(order.src_amount, order.estimated_dst_amount, amount, None)?,
+            get_dst_amount(order.src_amount, order.estimated_dst_amount, fill_amount, None)?,
         )?;
 
-        // Taker => Maker
+        // Taker pays dst to maker (native or SPL).
         let mut params = if order.dst_asset_is_native {
             UniTransferParams::NativeTransfer {
                 from: ctx.accounts.taker.to_account_info(),
@@ -247,7 +202,6 @@ pub mod clearstone_fusion {
         };
         uni_transfer(&params)?;
 
-        // Take protocol fee
         if protocol_fee_amount > 0 {
             match &mut params {
                 UniTransferParams::NativeTransfer { amount, to, .. }
@@ -264,7 +218,6 @@ pub mod clearstone_fusion {
             uni_transfer(&params)?;
         }
 
-        // Take integrator fee
         if integrator_fee_amount > 0 {
             match &mut params {
                 UniTransferParams::NativeTransfer { amount, to, .. }
@@ -281,314 +234,80 @@ pub mod clearstone_fusion {
             uni_transfer(&params)?;
         }
 
-        // Close escrow if all tokens are filled
-        if ctx.accounts.escrow_src_ata.amount == amount {
-            close_account(CpiContext::new_with_signer(
-                ctx.accounts.src_token_program.to_account_info(),
-                CloseAccount {
-                    account: ctx.accounts.escrow_src_ata.to_account_info(),
-                    destination: ctx.accounts.maker.to_account_info(),
-                    authority: ctx.accounts.escrow.to_account_info(),
-                },
-                &[&[
-                    "escrow".as_bytes(),
-                    ctx.accounts.maker.key().as_ref(),
-                    order_hash,
-                    &[ctx.bumps.escrow],
-                ]],
-            ))?;
-        }
+        ctx.accounts.order_state.filled_amount = filled
+            .checked_add(fill_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
 
         Ok(())
     }
 
-    pub fn cancel(
-        ctx: Context<Cancel>,
-        order_hash: [u8; 32],
-        order_src_asset_is_native: bool,
-    ) -> Result<()> {
-        require!(
-            ctx.accounts.src_mint.key() == native_mint::id() || !order_src_asset_is_native,
-            FusionError::InconsistentNativeSrcTrait
-        );
-
-        require!(
-            order_src_asset_is_native == ctx.accounts.maker_src_ata.is_none(),
-            FusionError::InconsistentNativeSrcTrait
-        );
-
-        // Return remaining src tokens back to maker
-        if !order_src_asset_is_native {
-            transfer_checked(
-                CpiContext::new_with_signer(
-                    ctx.accounts.src_token_program.to_account_info(),
-                    TransferChecked {
-                        from: ctx.accounts.escrow_src_ata.to_account_info(),
-                        mint: ctx.accounts.src_mint.to_account_info(),
-                        to: ctx
-                            .accounts
-                            .maker_src_ata
-                            .as_ref()
-                            .ok_or(FusionError::MissingMakerSrcAta)?
-                            .to_account_info(),
-                        authority: ctx.accounts.escrow.to_account_info(),
-                    },
-                    &[&[
-                        "escrow".as_bytes(),
-                        ctx.accounts.maker.key().as_ref(),
-                        &order_hash,
-                        &[ctx.bumps.escrow],
-                    ]],
-                ),
-                ctx.accounts.escrow_src_ata.amount,
-                ctx.accounts.src_mint.decimals,
-            )?;
+    /// Maker explicitly voids an outstanding order on-chain. Initializes
+    /// (or updates) `OrderState` with `canceled = true` so resolvers can
+    /// observe cancellation authoritatively instead of relying on stale
+    /// off-chain state.
+    pub fn cancel(ctx: Context<Cancel>, order: OrderConfig) -> Result<()> {
+        if ctx.accounts.order_state.expiration_time == 0 {
+            ctx.accounts.order_state.expiration_time = order.expiration_time;
+            ctx.accounts.order_state.bump = ctx.bumps.order_state;
         }
-
-        close_account(CpiContext::new_with_signer(
-            ctx.accounts.src_token_program.to_account_info(),
-            CloseAccount {
-                account: ctx.accounts.escrow_src_ata.to_account_info(),
-                destination: ctx.accounts.maker.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            },
-            &[&[
-                "escrow".as_bytes(),
-                ctx.accounts.maker.key().as_ref(),
-                &order_hash,
-                &[ctx.bumps.escrow],
-            ]],
-        ))
+        ctx.accounts.order_state.canceled = true;
+        ctx.accounts.order_state.filled_amount = order.src_amount;
+        Ok(())
     }
 
-    pub fn cancel_by_resolver(
-        ctx: Context<CancelByResolver>,
-        order: OrderConfig,
-        reward_limit: u64,
-        merkle_proof: Option<Vec<[u8; 32]>>,
-    ) -> Result<()> {
+    /// Permissionless sweep: close an expired `OrderState` PDA and send
+    /// the rent lamports to the caller. Works for any expired order, whether
+    /// partially filled, fully filled, or canceled.
+    pub fn clean_expired(ctx: Context<CleanExpired>, _order_hash: [u8; 32]) -> Result<()> {
         require!(
-            order.fee.max_cancellation_premium > 0,
-            FusionError::CancelOrderByResolverIsForbidden
-        );
-        let current_timestamp = Clock::get()?.unix_timestamp;
-        require!(
-            current_timestamp >= order.expiration_time as i64,
+            Clock::get()?.unix_timestamp >= ctx.accounts.order_state.expiration_time as i64,
             FusionError::OrderNotExpired
         );
-        require!(
-            order.src_asset_is_native == ctx.accounts.maker_src_ata.is_none(),
-            FusionError::InconsistentNativeSrcTrait
-        );
-
-        enforce_resolver_policy(
-            &order.resolver_policy,
-            &ctx.accounts.resolver.key(),
-            merkle_proof,
-        )?;
-
-        let order_hash = order_hash(
-            &order,
-            ctx.accounts.protocol_dst_acc.as_ref().map(|acc| acc.key()),
-            ctx.accounts
-                .integrator_dst_acc
-                .as_ref()
-                .map(|acc| acc.key()),
-            ctx.accounts.src_mint.key(),
-            ctx.accounts.dst_mint.key(),
-            ctx.accounts.maker_receiver.key(),
-        )?;
-
-        // Return remaining src tokens back to maker
-        if !order.src_asset_is_native {
-            transfer_checked(
-                CpiContext::new_with_signer(
-                    ctx.accounts.src_token_program.to_account_info(),
-                    TransferChecked {
-                        from: ctx.accounts.escrow_src_ata.to_account_info(),
-                        mint: ctx.accounts.src_mint.to_account_info(),
-                        to: ctx
-                            .accounts
-                            .maker_src_ata
-                            .as_ref()
-                            .ok_or(FusionError::MissingMakerSrcAta)?
-                            .to_account_info(),
-                        authority: ctx.accounts.escrow.to_account_info(),
-                    },
-                    &[&[
-                        "escrow".as_bytes(),
-                        ctx.accounts.maker.key().as_ref(),
-                        &order_hash,
-                        &[ctx.bumps.escrow],
-                    ]],
-                ),
-                ctx.accounts.escrow_src_ata.amount,
-                ctx.accounts.src_mint.decimals,
-            )?;
-        };
-
-        let cancellation_premium = calculate_premium(
-            current_timestamp as u32,
-            order.expiration_time,
-            order.cancellation_auction_duration,
-            order.fee.max_cancellation_premium,
-        );
-        let maker_amount = ctx.accounts.escrow_src_ata.to_account_info().lamports()
-            - std::cmp::min(cancellation_premium, reward_limit);
-
-        // Transfer all the remaining lamports to the resolver first
-        close_account(CpiContext::new_with_signer(
-            ctx.accounts.src_token_program.to_account_info(),
-            CloseAccount {
-                account: ctx.accounts.escrow_src_ata.to_account_info(),
-                destination: ctx.accounts.resolver.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            },
-            &[&[
-                "escrow".as_bytes(),
-                ctx.accounts.maker.key().as_ref(),
-                &order_hash,
-                &[ctx.bumps.escrow],
-            ]],
-        ))?;
-
-        // Transfer all lamports from the closed account, minus the cancellation premium, to the maker
-        uni_transfer(&UniTransferParams::NativeTransfer {
-            from: ctx.accounts.resolver.to_account_info(),
-            to: ctx.accounts.maker.to_account_info(),
-            amount: maker_amount,
-            program: ctx.accounts.system_program.clone(),
-        })
+        Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
 #[derive(Accounts)]
 #[instruction(order: OrderConfig)]
-pub struct Create<'info> {
-    system_program: Program<'info, System>,
-
-    /// PDA derived from order details, acting as the authority for the escrow ATA
-    #[account(
-        seeds = [
-            "escrow".as_bytes(),
-            maker.key().as_ref(),
-            &order_hash(
-                &order,
-                protocol_dst_acc.clone().map(|acc| acc.key()),
-                integrator_dst_acc.clone().map(|acc| acc.key()),
-                src_mint.key(),
-                dst_mint.key(),
-                maker_receiver.key(),
-            )?,
-        ],
-        bump,
-    )]
-    /// CHECK: check is not needed here as we never initialize the account
-    escrow: UncheckedAccount<'info>,
-
-    /// Source asset
-    src_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    src_token_program: Interface<'info, TokenInterface>,
-
-    /// ATA of src_mint to store escrowed tokens
-    #[account(
-        init,
-        payer = maker,
-        associated_token::mint = src_mint,
-        associated_token::authority = escrow,
-        associated_token::token_program = src_token_program,
-    )]
-    escrow_src_ata: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// `maker`, who is willing to sell src token for dst token
+pub struct Fill<'info> {
+    /// Resolver / taker, authorized by the order's `resolver_policy`.
     #[account(mut, signer)]
-    maker: Signer<'info>,
+    pub taker: Signer<'info>,
 
-    /// Maker's ATA of src_mint
+    /// CHECK: maker is verified via the preceding Ed25519 instruction
+    /// over `order_hash`, which binds this pubkey to the order.
+    #[account(mut)]
+    pub maker: UncheckedAccount<'info>,
+
+    /// CHECK: must match `order.receiver` (checked via `order_hash` seeds).
+    #[account(mut)]
+    pub maker_receiver: UncheckedAccount<'info>,
+
+    pub src_mint: Box<InterfaceAccount<'info, Mint>>,
+    pub dst_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Maker's ATA of `src_mint` — tokens are pulled from here via the
+    /// program's delegate PDA.
     #[account(
         mut,
         associated_token::mint = src_mint,
         associated_token::authority = maker,
         associated_token::token_program = src_token_program,
     )]
-    maker_src_ata: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
+    pub maker_src_ata: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Destination asset
-    dst_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// CHECK: maker_receiver only has to be equal to escrow parameter
-    maker_receiver: UncheckedAccount<'info>,
-
-    associated_token_program: Program<'info, AssociatedToken>,
-
-    protocol_dst_acc: Option<UncheckedAccount<'info>>,
-
-    integrator_dst_acc: Option<UncheckedAccount<'info>>,
-}
-
-#[derive(Accounts)]
-#[instruction(order: OrderConfig)]
-pub struct Fill<'info> {
-    /// `taker`, who buys `src_mint` for `dst_mint`. Authorized per the
-    /// order's `resolver_policy`.
-    #[account(mut, signer)]
-    taker: Signer<'info>,
-
-    /// CHECK: check is not necessary as maker is not spending any funds
-    #[account(mut)]
-    maker: UncheckedAccount<'info>,
-
-    /// CHECK: maker_receiver only has to be equal to escrow parameter
-    #[account(mut)]
-    maker_receiver: UncheckedAccount<'info>,
-
-    /// Maker asset
-    src_mint: Box<InterfaceAccount<'info, Mint>>,
-    /// Taker asset
-    dst_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// PDA derived from order details, acting as the authority for the escrow ATA
-    #[account(
-        seeds = [
-            "escrow".as_bytes(),
-            maker.key().as_ref(),
-            &order_hash(
-                &order,
-                protocol_dst_acc.clone().map(|acc| acc.key()),
-                integrator_dst_acc.clone().map(|acc| acc.key()),
-                src_mint.key(),
-                dst_mint.key(),
-                maker_receiver.key(),
-            )?,
-        ],
-        bump,
-    )]
-    /// CHECK: check is not needed here as we never initialize the account
-    escrow: UncheckedAccount<'info>,
-
-    /// ATA of src_mint to store escrowed tokens
-    #[account(
-        mut,
-        associated_token::mint = src_mint,
-        associated_token::authority = escrow,
-        associated_token::token_program = src_token_program,
-    )]
-    escrow_src_ata: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// Taker's ATA of src_mint
+    /// Taker's ATA of `src_mint`.
     #[account(
         mut,
         constraint = taker_src_ata.mint.key() == src_mint.key()
     )]
-    taker_src_ata: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub taker_src_ata: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    src_token_program: Interface<'info, TokenInterface>,
-    dst_token_program: Interface<'info, TokenInterface>,
-    system_program: Program<'info, System>,
-    associated_token_program: Program<'info, AssociatedToken>,
-
-    /// Maker's ATA of dst_mint
+    /// Maker receiver's ATA of `dst_mint`; created if missing.
     #[account(
         init_if_needed,
         payer = taker,
@@ -596,97 +315,34 @@ pub struct Fill<'info> {
         associated_token::authority = maker_receiver,
         associated_token::token_program = dst_token_program,
     )]
-    maker_dst_ata: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
+    pub maker_dst_ata: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
 
-    /// Taker's ATA of dst_mint
+    /// Taker's ATA of `dst_mint`.
     #[account(
         mut,
         associated_token::mint = dst_mint,
         associated_token::authority = taker,
         associated_token::token_program = dst_token_program,
     )]
-    taker_dst_ata: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
+    pub taker_dst_ata: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
 
     #[account(mut)]
-    protocol_dst_acc: Option<UncheckedAccount<'info>>,
-
+    pub protocol_dst_acc: Option<UncheckedAccount<'info>>,
     #[account(mut)]
-    integrator_dst_acc: Option<UncheckedAccount<'info>>,
-}
+    pub integrator_dst_acc: Option<UncheckedAccount<'info>>,
 
-#[derive(Accounts)]
-#[instruction(order_hash: [u8; 32])]
-pub struct Cancel<'info> {
-    /// Account that created the escrow
-    #[account(mut, signer)]
-    maker: Signer<'info>,
-
-    /// Maker asset
-    src_mint: InterfaceAccount<'info, Mint>,
-
-    /// PDA derived from order details, acting as the authority for the escrow ATA
+    /// Per-order state. Initialized on first fill; taker pays rent.
     #[account(
+        init_if_needed,
+        payer = taker,
+        space = 8 + OrderState::INIT_SPACE,
         seeds = [
-            "escrow".as_bytes(),
-            maker.key().as_ref(),
-            &order_hash,
-        ],
-        bump,
-    )]
-    /// CHECK: check is not needed here as we never initialize the account
-    escrow: UncheckedAccount<'info>,
-
-    /// ATA of src_mint to store escrowed tokens
-    #[account(
-        mut,
-        associated_token::mint = src_mint,
-        associated_token::authority = escrow,
-        associated_token::token_program = src_token_program,
-    )]
-    escrow_src_ata: InterfaceAccount<'info, TokenAccount>,
-
-    /// Maker's ATA of src_mint
-    #[account(
-        mut,
-        associated_token::mint = src_mint,
-        associated_token::authority = maker,
-        associated_token::token_program = src_token_program,
-    )]
-    maker_src_ata: Option<InterfaceAccount<'info, TokenAccount>>,
-
-    src_token_program: Interface<'info, TokenInterface>,
-}
-
-#[derive(Accounts)]
-#[instruction(order: OrderConfig)]
-pub struct CancelByResolver<'info> {
-    /// Account that cancels the escrow. Authorized per the order's
-    /// `resolver_policy`.
-    #[account(mut, signer)]
-    resolver: Signer<'info>,
-
-    /// CHECK: check is not necessary as maker is not spending any funds
-    #[account(mut)]
-    maker: UncheckedAccount<'info>,
-
-    /// CHECK: maker_receiver only has to be equal to escrow parameter
-    maker_receiver: UncheckedAccount<'info>,
-
-    /// Maker asset
-    src_mint: InterfaceAccount<'info, Mint>,
-
-    /// Taker asset
-    dst_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// PDA derived from order details, acting as the authority for the escrow ATA
-    #[account(
-        seeds = [
-            "escrow".as_bytes(),
+            ORDER_STATE_SEED,
             maker.key().as_ref(),
             &order_hash(
                 &order,
-                protocol_dst_acc.clone().map(|acc| acc.key()),
-                integrator_dst_acc.clone().map(|acc| acc.key()),
+                protocol_dst_acc.clone().map(|a| a.key()),
+                integrator_dst_acc.clone().map(|a| a.key()),
                 src_mint.key(),
                 dst_mint.key(),
                 maker_receiver.key(),
@@ -694,72 +350,107 @@ pub struct CancelByResolver<'info> {
         ],
         bump,
     )]
-    /// CHECK: check is not needed here as we never initialize the account
-    escrow: UncheckedAccount<'info>,
+    pub order_state: Account<'info, OrderState>,
 
-    /// ATA of src_mint to store escrowed tokens
-    #[account(
-        mut,
-        associated_token::mint = src_mint,
-        associated_token::authority = escrow,
-        associated_token::token_program = src_token_program,
-    )]
-    escrow_src_ata: InterfaceAccount<'info, TokenAccount>,
+    /// Program's delegate PDA; signs the `TransferChecked` that pulls the
+    /// maker's src tokens. The maker must have previously `Approve`d this
+    /// PDA on `maker_src_ata`.
+    /// CHECK: seed-derived; has no backing data.
+    #[account(seeds = [DELEGATE_SEED], bump)]
+    pub delegate_authority: UncheckedAccount<'info>,
 
-    /// Maker's ATA of src_mint
-    #[account(
-        mut,
-        associated_token::mint = src_mint,
-        associated_token::authority = maker,
-        associated_token::token_program = src_token_program,
-    )]
-    maker_src_ata: Option<InterfaceAccount<'info, TokenAccount>>,
+    pub src_token_program: Interface<'info, TokenInterface>,
+    pub dst_token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 
-    src_token_program: Interface<'info, TokenInterface>,
-    system_program: Program<'info, System>,
-
-    protocol_dst_acc: Option<UncheckedAccount<'info>>,
-
-    integrator_dst_acc: Option<UncheckedAccount<'info>>,
+    /// CHECK: sysvar read to find the preceding Ed25519 verify instruction.
+    #[account(address = sysvar::instructions::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
 }
 
-/// Configuration for fees applied to the escrow
+#[derive(Accounts)]
+#[instruction(order: OrderConfig)]
+pub struct Cancel<'info> {
+    #[account(mut, signer)]
+    pub maker: Signer<'info>,
+
+    pub src_mint: Box<InterfaceAccount<'info, Mint>>,
+    pub dst_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// CHECK: must match `order.receiver` (checked via `order_hash` seeds).
+    pub maker_receiver: UncheckedAccount<'info>,
+
+    /// CHECK: must match `order.fee.protocol_dst_acc` (checked via `order_hash` seeds).
+    pub protocol_dst_acc: Option<UncheckedAccount<'info>>,
+    /// CHECK: must match `order.fee.integrator_dst_acc` (checked via `order_hash` seeds).
+    pub integrator_dst_acc: Option<UncheckedAccount<'info>>,
+
+    #[account(
+        init_if_needed,
+        payer = maker,
+        space = 8 + OrderState::INIT_SPACE,
+        seeds = [
+            ORDER_STATE_SEED,
+            maker.key().as_ref(),
+            &order_hash(
+                &order,
+                protocol_dst_acc.clone().map(|a| a.key()),
+                integrator_dst_acc.clone().map(|a| a.key()),
+                src_mint.key(),
+                dst_mint.key(),
+                maker_receiver.key(),
+            )?,
+        ],
+        bump,
+    )]
+    pub order_state: Account<'info, OrderState>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(order_hash: [u8; 32])]
+pub struct CleanExpired<'info> {
+    #[account(mut, signer)]
+    pub cleaner: Signer<'info>,
+
+    /// CHECK: identifies the order by serving as the `maker` component of the PDA seed.
+    pub maker: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [ORDER_STATE_SEED, maker.key().as_ref(), &order_hash],
+        bump = order_state.bump,
+        close = cleaner,
+    )]
+    pub order_state: Account<'info, OrderState>,
+}
+
+// ---------------------------------------------------------------------------
+// OrderConfig + ResolverPolicy
+// ---------------------------------------------------------------------------
+
+/// Configuration for fees applied to an order.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
 pub struct FeeConfig {
-    /// Protocol fee in basis points where `BASE_1E5` = 100%
-    protocol_fee: u16,
-
-    /// Integrator fee in basis points where `BASE_1E5` = 100%
-    integrator_fee: u16,
-
-    /// Percentage of positive slippage taken by the protocol as an additional fee.
-    /// Value in basis points where `BASE_1E2` = 100%
-    surplus_percentage: u8,
-
-    /// Maximum cancellation premium
-    /// Value in absolute lamports amount
-    max_cancellation_premium: u64,
+    pub protocol_fee: u16,
+    pub integrator_fee: u16,
+    pub surplus_percentage: u8,
 }
 
-/// Maximum number of resolver pubkeys that can be carried inline in
-/// `ResolverPolicy::AllowedList`. Sets are capped here to bound instruction-
-/// data size; larger sets must use `MerkleRoot`.
-pub const MAX_ALLOWED_LIST_LEN: usize = 16;
+/// Hard cap on the inline AllowedList size. 10 resolvers × 32 bytes + list
+/// prefix keeps the fill instruction comfortably under Solana's 1232-byte
+/// transaction limit together with the rest of the order payload, accounts,
+/// and preceding Ed25519 verify ix. Larger curated sets must use `MerkleRoot`.
+pub const MAX_ALLOWED_LIST_LEN: usize = 10;
 
-/// Per-order, maker-signed resolver access policy.
-///
-/// The maker's signature binds the policy via `order_hash` (which includes
-/// the full `OrderConfig`), so a taker cannot substitute a different policy
-/// at fill time — the escrow PDA would not derive.
+/// Per-order maker-signed resolver policy.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum ResolverPolicy {
-    /// Inline list of allowed resolver pubkeys. An empty list means
-    /// permissionless (any taker may fill / cancel-by-resolver). This is
-    /// the default variant emitted by `Default`.
+    /// Inline list of permitted takers. Empty = permissionless.
     AllowedList(Vec<Pubkey>),
-    /// Keccak256 Merkle root over allowed resolver pubkeys (OZ-style
-    /// sorted pairs). The fill/cancel instruction takes a merkle proof
-    /// argument which is verified against this root.
+    /// Keccak256 Merkle root over permitted takers (OZ-style sorted pairs).
     MerkleRoot([u8; 32]),
 }
 
@@ -769,20 +460,27 @@ impl Default for ResolverPolicy {
     }
 }
 
+/// Off-chain-signed order submitted by the maker.
+///
+/// `src_asset_is_native` is intentionally absent: the pull-settlement model
+/// relies on SPL Token `Approve`, which native SOL doesn't support — sellers
+/// of SOL must wrap to wSOL before signing an order.
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct OrderConfig {
-    id: u32,
-    src_amount: u64,
-    min_dst_amount: u64,
-    estimated_dst_amount: u64,
-    expiration_time: u32,
-    src_asset_is_native: bool,
-    dst_asset_is_native: bool,
-    fee: FeeConfig,
-    dutch_auction_data: AuctionData,
-    cancellation_auction_duration: u32,
-    resolver_policy: ResolverPolicy,
+    pub id: u32,
+    pub src_amount: u64,
+    pub min_dst_amount: u64,
+    pub estimated_dst_amount: u64,
+    pub expiration_time: u32,
+    pub dst_asset_is_native: bool,
+    pub fee: FeeConfig,
+    pub dutch_auction_data: AuctionData,
+    pub resolver_policy: ResolverPolicy,
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn enforce_resolver_policy(
     policy: &ResolverPolicy,
@@ -816,6 +514,9 @@ fn enforce_resolver_policy(
     }
 }
 
+/// Canonical hash of the full order, domain-separated by `program_id` so a
+/// maker's signature over one deployment cannot be replayed on a sibling
+/// program. The maker signs this exact byte string off-chain.
 fn order_hash(
     order: &OrderConfig,
     protocol_dst_acc: Option<Pubkey>,
@@ -825,6 +526,7 @@ fn order_hash(
     receiver: Pubkey,
 ) -> Result<[u8; 32]> {
     Ok(hashv(&[
+        &crate::ID.to_bytes(),
         &order.try_to_vec()?,
         &protocol_dst_acc.try_to_vec()?,
         &integrator_dst_acc.try_to_vec()?,
@@ -835,7 +537,6 @@ fn order_hash(
     .to_bytes())
 }
 
-// Function to get amount of `dst_mint` tokens that the taker should pay to the maker using default or the dutch auction formula
 fn get_dst_amount(
     initial_src_amount: u64,
     initial_dst_amount: u64,
@@ -926,3 +627,4 @@ fn uni_transfer(params: &UniTransferParams<'_>) -> Result<()> {
         ),
     }
 }
+
