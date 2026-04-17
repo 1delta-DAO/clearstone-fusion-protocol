@@ -39,6 +39,59 @@ This is a **single-chain (Solana → Solana)** protocol. No cross-chain primitiv
 **Expired-order cleanup**:
 - `clean_expired(order_hash)` — permissionless after expiration. Closes the `OrderState` PDA and sends the rent to the caller.
 
+### Fill sequence at a glance
+
+```
+maker                                                              filler
+-----                                                              ------
+approve(delegate_pda, cap)  ──────── on-chain, once ──────────►
+orderConfig = {...}         ─┐
+orderHash   = sha256(        │
+  program_id ||              │
+  borsh(orderConfig)         │
+)                            │
+signature   = ed25519_sign(  │ off-chain
+  makerSecret, orderHash)    │
+publish({orderConfig,        │
+  signature, makerPubkey}) ──┴─────► relayer / websocket / DM ──►  discover fresh order
+                                                                   build tx:
+                                                                     [ Ed25519Program.verify(
+                                                                         makerPubkey, orderHash, sig
+                                                                       ),
+                                                                       fusion.fill(
+                                                                         orderConfig, amount, proof?
+                                                                       )
+                                                                     ]
+                                                                   taker signs, sends
+                                                                   program:
+                                                                     • reads preceding ed25519 ix
+                                                                       (must match maker + hash)
+                                                                     • enforces resolver_policy
+                                                                     • pulls src via delegate PDA
+                                                                     • taker pays dst → maker
+                                                                     • updates OrderState.filled_amount
+```
+
+Only the taker signs the Solana transaction. The maker's authorisation is carried entirely by the Ed25519 signature that the native precompile verifies — no maker presence on-chain is required past the initial one-time `approve`.
+
+## Using as a limit-order book
+
+This repo is a **settlement primitive**, not a complete exchange. The shape is essentially the same as Seaport / 0x v4 / 1inch LOP on EVM — off-chain signed orders, on-chain pull-fill against a delegation — so it works as a LOB backend with the following caveats:
+
+**Already works out of the box:**
+- Off-chain signed orders with canonical domain-separated hashes.
+- Partial fills via `OrderState.filled_amount` (cumulative, bounded by `src_amount`).
+- Permissionless fillers (`AllowedList([])`, the default) for a public book, or gated fillers (`AllowedList([pubkeys...])` / `MerkleRoot`) for market-maker-only venues.
+- On-chain cancellation (`cancel`) and permissionless rent-refund cleanup (`clean_expired`).
+- Multiple concurrent orders per maker against the same balance (capped by the `approve` amount).
+
+**What you'd add or tune for a full LOB:**
+1. **Fixed-price (non-auction) orders.** Today `dutch_auction_data` is required. For classic LOB semantics, set `startTime = u32::MAX`, `initialRateBump = 0`, `pointsAndTimeDeltas = []` — the rate bump collapses to zero and the price stays at `min_dst_amount / src_amount`. A cleaner LOB fork would make `dutch_auction_data` optional and short-circuit the math when absent.
+2. **Off-chain order feed.** The program stores nothing until a first fill lands. A LOB UI needs an aggregator (WebSocket feed, REST index, or gossip) to hold signed orders, compute depth, and show quotes. Same infra as any signed-order exchange.
+3. **Matching / priority.** This protocol is first-filler-wins at whatever the price is at that moment — there's no price/time priority enforced on-chain. If you want deterministic crossing, run an off-chain matcher that broadcasts the winning fill (same pattern 1inch uses for resolver-only Fusion auctions).
+4. **Fee schedule.** Fees are per-order (`OrderConfig.fee`), not venue-wide. A LOB would typically fix these at the UI/API layer.
+5. **Native SOL.** Sellers of SOL must pre-wrap to wSOL (SPL `Approve` doesn't apply to native SOL). A LOB UI should handle the wrap transparently.
+
 ## Resolver policy
 
 Unchanged concept from the prior fork iteration, restated here:
