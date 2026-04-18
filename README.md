@@ -117,7 +117,7 @@ The policy is part of the signed `OrderConfig` and therefore hashed into `order_
   - `state.rs` — `OrderState` account
   - `merkle.rs` — keccak256 sorted-pair verifier + unit tests
   - `auction.rs`, `error.rs`
-- `tests/suits/`
+- `tests/suites/`
   - `fill.ts` — full fill, partial fills, delegation-missing
   - `signature-cancel.ts` — Ed25519 enforcement, `cancel`, `clean_expired`
   - `resolver-policy.ts` — per-policy authorization

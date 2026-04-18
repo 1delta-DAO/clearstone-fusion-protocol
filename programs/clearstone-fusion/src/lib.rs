@@ -8,10 +8,11 @@ use anchor_spl::{
     },
 };
 use auction::{calculate_rate_bump, AuctionData};
-use common::constants::*;
+use constants::*;
 use muldiv::MulDiv;
 
 pub mod auction;
+pub mod constants;
 pub mod error;
 pub mod merkle;
 pub mod sig;
